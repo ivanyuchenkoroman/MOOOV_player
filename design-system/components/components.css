@@ -1,0 +1,151 @@
+/* MOOOV design system 1.1.0: components for the web.
+   Same rules as the Qt stylesheet in qt/ui_theme.py. Needs tokens/tokens.css loaded first.
+   Shape rule: circles and capsules only (the "O" of the logo). Cards get --mo-radius-card. */
+
+.mo {
+  font-family: var(--mo-font);
+  font-size: var(--mo-font-size);
+  color: var(--mo-text);
+  background: var(--mo-bg);
+  -webkit-font-smoothing: antialiased;
+}
+.mo-surface { background: var(--mo-surface); }
+
+/* ---------- buttons ---------- */
+.mo-btn {
+  box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: var(--mo-control-h); padding: 0 var(--mo-pad-x);
+  font: inherit; color: var(--mo-text); white-space: nowrap;
+  background: var(--mo-control); border: 1px solid var(--mo-border); border-radius: var(--mo-radius);
+  cursor: pointer; user-select: none;
+}
+.mo-btn:hover { background: var(--mo-hover); }
+.mo-btn:active { background: var(--mo-surface); }
+.mo-btn[aria-pressed="true"], .mo-btn.is-checked { background: var(--mo-accent-tint); border-color: var(--mo-accent); }
+.mo-btn:disabled { color: var(--mo-muted); cursor: default; background: var(--mo-control); }
+.mo-btn:focus-visible { outline: none; border-color: var(--mo-accent); }
+.mo-btn svg { width: calc(var(--mo-icon) - 2px); height: calc(var(--mo-icon) - 2px); flex: none; }
+
+/* icon only: a circle, diameter = control height */
+.mo-btn--icon { width: var(--mo-control-h); padding: 0; }
+.mo-btn--icon svg { width: var(--mo-icon); height: var(--mo-icon); }
+
+/* primary: one per screen (Play). Yellow circle, black icon */
+.mo-btn--primary {
+  width: var(--mo-control-h-primary); height: var(--mo-control-h-primary); padding: 0;
+  color: var(--mo-on-accent); background: var(--mo-accent); border-color: var(--mo-accent);
+  border-radius: calc(var(--mo-control-h-primary) / 2);
+}
+.mo-btn--primary:hover { background: var(--mo-accent-hover); border-color: var(--mo-accent-hover); }
+.mo-btn--primary:active { background: var(--mo-accent-pressed); }
+.mo-btn--primary svg { width: var(--mo-icon); height: var(--mo-icon); }
+
+/* ---------- fields ---------- */
+.mo-field, .mo-select {
+  box-sizing: border-box;
+  height: var(--mo-control-h); padding: 0 var(--mo-field-pad-x);
+  font: inherit; color: var(--mo-text);
+  background: var(--mo-control); border: 1px solid var(--mo-border); border-radius: var(--mo-radius);
+  font-variant-numeric: tabular-nums;
+}
+.mo-field::placeholder { color: var(--mo-muted); }
+.mo-field:hover, .mo-select:hover { border-color: var(--mo-border-hi); }
+.mo-field:focus, .mo-select:focus { outline: none; border-color: var(--mo-accent); }
+.mo-field::selection { background: var(--mo-accent-tint); }
+.mo-select {
+  appearance: none; -webkit-appearance: none; padding-right: 28px; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5 L5 6.5 L8 3.5' fill='none' stroke='%238c8c8c' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 12px center; background-size: 10px;
+}
+.mo-textarea {
+  box-sizing: border-box; padding: 8px 12px; font: inherit; color: var(--mo-text); resize: vertical;
+  background: var(--mo-control); border: 1px solid var(--mo-border); border-radius: var(--mo-radius-card);
+}
+.mo-textarea:focus { outline: none; border-color: var(--mo-accent); }
+
+/* frame counter: yellow, bold, centred */
+.mo-frame { color: var(--mo-accent); font-weight: 600; text-align: center; padding: 0; }
+
+/* ---------- checkbox: a circle ---------- */
+.mo-check { display: inline-flex; align-items: center; gap: 7px; min-height: var(--mo-control-h); cursor: pointer; }
+.mo-check input {
+  appearance: none; -webkit-appearance: none; margin: 0; flex: none;
+  width: calc(var(--mo-control-h) - 2px); height: calc(var(--mo-control-h) - 2px);
+  border: 1px solid var(--mo-border); border-radius: 50%; background: var(--mo-control) center / 12px no-repeat;
+  cursor: pointer;
+}
+.mo-check input:hover { border-color: var(--mo-border-hi); }
+.mo-check input:checked {
+  background-color: var(--mo-accent); border-color: var(--mo-accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.2 L5 8.6 L9.6 3.4' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+.mo-check input:focus-visible { outline: none; border-color: var(--mo-accent); }
+
+/* ---------- secondary size: ~30% smaller ---------- */
+.mo-small { font-size: var(--mo-font-size-small); }
+.mo-small.mo-btn, .mo-small .mo-btn { height: var(--mo-control-h-small); border-radius: var(--mo-radius-small); padding: 0 10px; }
+.mo-small.mo-btn--icon, .mo-small .mo-btn--icon { width: var(--mo-control-h-small); padding: 0; }
+.mo-small.mo-btn svg, .mo-small .mo-btn svg { width: var(--mo-icon-small); height: var(--mo-icon-small); }
+.mo-small.mo-field, .mo-small .mo-field, .mo-small.mo-select, .mo-small .mo-select {
+  height: var(--mo-control-h-small); border-radius: var(--mo-radius-small); padding: 0 var(--mo-field-pad-x-small);
+}
+.mo-small.mo-select, .mo-small .mo-select { padding-right: 20px; background-position: right 8px center; background-size: 8px; }
+.mo-small.mo-check input, .mo-small .mo-check input {
+  width: calc(var(--mo-control-h-small) - 2px); height: calc(var(--mo-control-h-small) - 2px); background-size: 9px;
+}
+
+/* ---------- popups ---------- */
+.mo-menu {
+  display: flex; flex-direction: column; min-width: 160px; padding: 6px;
+  background: var(--mo-control); border: 1px solid var(--mo-border); border-radius: var(--mo-radius-menu);
+}
+.mo-menu-item {
+  display: flex; justify-content: space-between; gap: 24px; padding: 5px 18px;
+  border-radius: var(--mo-radius-menu-item); color: var(--mo-text); cursor: default;
+}
+.mo-menu-item:hover, .mo-menu-item.is-active { background: var(--mo-accent-tint); }
+.mo-menu-item kbd { font: inherit; color: var(--mo-dim); }
+.mo-menu-sep { height: 1px; margin: 4px 10px; background: var(--mo-border); }
+.mo-tooltip {
+  display: inline-block; padding: 4px 8px; color: var(--mo-text);
+  background: var(--mo-control); border: 1px solid var(--mo-border); border-radius: var(--mo-radius-tooltip);
+}
+
+/* ---------- blocks ---------- */
+.mo-card {
+  padding: 12px 14px; background: var(--mo-control);
+  border: 1px solid var(--mo-border); border-radius: var(--mo-radius-card);
+}
+.mo-card.is-selected { background: var(--mo-accent-tint); border-color: var(--mo-accent-line); }
+.mo-section-title {
+  color: var(--mo-dim); font-size: var(--mo-font-size-small); font-weight: 600;
+  letter-spacing: 0.5px; text-transform: uppercase;
+}
+.mo-dim { color: var(--mo-dim); }
+
+/* comment badge / counter: yellow circle or capsule with black text */
+.mo-badge {
+  box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px;
+  font-size: var(--mo-font-size-small); font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--mo-on-note); background: var(--mo-note);
+}
+
+/* playhead tag: capsule with timecode */
+.mo-playhead {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 8px; border-radius: 9px;
+  font-size: var(--mo-font-size-small); font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--mo-on-accent); background: var(--mo-accent);
+}
+
+/* colour swatch for the drawing palette */
+.mo-swatch {
+  width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--mo-border-hi); cursor: pointer;
+}
+.mo-swatch.is-active { box-shadow: 0 0 0 2px var(--mo-bg), 0 0 0 3px var(--mo-accent); }
+
+/* scrollbar */
+.mo ::-webkit-scrollbar { width: 8px; height: 8px; }
+.mo ::-webkit-scrollbar-thumb { background: var(--mo-border-hi); border-radius: 2px; border: 2px solid transparent; background-clip: padding-box; }
+.mo ::-webkit-scrollbar-track { background: transparent; }

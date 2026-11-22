@@ -1,0 +1,9 @@
+# окружение и сборки
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+# комментарии к медиа и системный мусор
+*.mooov.json
+.DS_Store
