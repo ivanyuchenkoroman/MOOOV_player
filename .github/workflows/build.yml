@@ -1,0 +1,65 @@
+# Сборка обеих версий на машинах GitHub: Mac (Apple Silicon) и Windows.
+# Запускается: вручную (Actions → Build → Run workflow) или тегом версии (git tag v1.2.0 && git push --tags).
+# С тегом обе сборки кладутся в Release на GitHub.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-14  # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build app and DMG
+        run: bash packaging/build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MOOOV_player-mac
+          path: dist/*.dmg
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build program
+        shell: pwsh
+        run: |
+          uv sync
+          uv run python packaging\make_icons.py
+          uv run pyinstaller --noconfirm --clean packaging\MOOOV_player.spec
+      - name: Build installer and zip
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Force dist\MOOOV_player "dist\MOOOV_player-$ver-win-portable.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MOOOV_player-windows
+          path: |
+            dist/*-win-setup.exe
+            dist/*-win-portable.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
