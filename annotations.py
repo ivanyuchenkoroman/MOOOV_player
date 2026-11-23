@@ -21,10 +21,12 @@ class Stroke:
     color: str
     width: float  # доля высоты кадра
     pts: list  # [[x, y], ...] в долях ширины/высоты кадра; у image — два угла [лево-верх, право-низ]
+    #            у pen с пером (Wacom) — [x, y, нажим 0…1]: старые версии берут только x, y
     data: str = ""  # image: сама картинка (PNG/JPG в base64), хранится прямо в .mooov.json
     alpha: float = 1.0  # непрозрачность штриха / картинки (0.25 … 1)
 
 
+SKETCH_TEXT = "Sketch on frame"  # подпись комментария-рисунка без текста (в плеере и в PDF)
 REF_MAX = 1600  # длинная сторона референса в комментарии — хватает для экрана и PDF, JSON не раздувается
 _IMG_CACHE = {}
 
@@ -87,6 +89,9 @@ class NoteStore:
                     data = json.load(f)
                 for d in data.get("notes", []):
                     d["strokes"] = [Stroke(**s) for s in d.get("strokes", [])]
+                    t = d.get("text", "")
+                    if t.startswith(SKETCH_TEXT):  # раньше подпись эскиза писалась в сам текст
+                        d["text"] = t[len(SKETCH_TEXT):].lstrip()
                     self.notes.append(Note(**d))
             except Exception as e:  # битый файл не должен ронять плеер
                 print("MOOOV_player: cannot read", path, e)
@@ -158,6 +163,70 @@ def _map(rect, q):
     return QtCore.QPointF(rect.x() + q[0] * rect.width(), rect.y() + q[1] * rect.height())
 
 
+PEN_MIN = 0.12  # толщина при самом лёгком касании пера — доля от size
+_PR_CACHE = {}
+_ELLIPSE_SIGN = None
+
+
+def _area_sign(poly):
+    a = 0.0
+    for i in range(len(poly)):
+        p0, p1 = poly[i], poly[(i + 1) % len(poly)]
+        a += p0.x() * p1.y() - p1.x() * p0.y()
+    return a >= 0
+
+
+def _chaikin(pts, n=2):
+    """Сглаживание ломаной (вместе с нажимом); концы на месте."""
+    for _ in range(n):
+        if len(pts) < 3:
+            break
+        out = [pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            out.append(tuple(0.75 * u + 0.25 * v for u, v in zip(a, b)))
+            out.append(tuple(0.25 * u + 0.75 * v for u, v in zip(a, b)))
+        out.append(pts[-1])
+        pts = out
+    return pts
+
+
+def _pressure_path(s, rect, w):
+    """Штрих пера переменной толщины: круги в точках + трапеции между ними, одна заливка без наложений."""
+    global _ELLIPSE_SIGN
+    key = (id(s), len(s.pts), tuple(s.pts[0]), s.width, rect.x(), rect.y(), rect.width(), rect.height())
+    path = _PR_CACHE.get(key)
+    if path is not None:
+        return path
+    if _ELLIPSE_SIGN is None:
+        e = QtGui.QPainterPath()
+        e.addEllipse(QtCore.QRectF(0, 0, 10, 10))
+        _ELLIPSE_SIGN = _area_sign(e.toFillPolygon())
+    pts = [(rect.x() + q[0] * rect.width(), rect.y() + q[1] * rect.height(), q[2] if len(q) > 2 else 1.0)
+           for q in s.pts]
+    pts = _chaikin(pts)
+    rad = [max(0.4, w / 2 * (PEN_MIN + (1 - PEN_MIN) * min(1.0, max(0.0, pr)))) for _, _, pr in pts]
+    path = QtGui.QPainterPath()
+    path.setFillRule(QtCore.Qt.WindingFill)
+    for (x, y, _), r in zip(pts, rad):
+        path.addEllipse(QtCore.QPointF(x, y), r, r)
+    for (x0, y0, _), (x1, y1, _), r0, r1 in zip(pts, pts[1:], rad, rad[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        ln = math.hypot(dx, dy)
+        if ln < 1e-6:
+            continue
+        nx, ny = -dy / ln, dx / ln
+        quad = [QtCore.QPointF(x0 + nx * r0, y0 + ny * r0), QtCore.QPointF(x1 + nx * r1, y1 + ny * r1),
+                QtCore.QPointF(x1 - nx * r1, y1 - ny * r1), QtCore.QPointF(x0 - nx * r0, y0 - ny * r0)]
+        if _area_sign(quad) != _ELLIPSE_SIGN:  # одно направление обхода — иначе в заливке дыры
+            quad.reverse()
+        path.addPolygon(QtGui.QPolygonF(quad))
+        path.closeSubpath()
+    if len(_PR_CACHE) > 400:
+        _PR_CACHE.clear()
+    _PR_CACHE[key] = path
+    return path
+
+
 def paint_stroke(p, s, rect, opacity=1.0):
     col = QtGui.QColor(s.color)
     col.setAlphaF(max(0.0, min(1.0, opacity * s.alpha)))
@@ -178,6 +247,11 @@ def paint_stroke(p, s, rect, opacity=1.0):
         p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 140), 1))  # тонкая рамка — картинка не сливается с кадром
         p.drawRect(r)
         p.restore()
+        return
+    if s.tool == "pen" and any(len(q) > 2 for q in s.pts):  # нарисовано пером с нажимом
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(col)
+        p.drawPath(_pressure_path(s, rect, w))
         return
     if s.tool == "pen":
         if len(pts) == 1:
@@ -279,7 +353,7 @@ def created_str(note):
 
 
 def export_pdf(path, items, get_image, file_label, timecode, progress=None, matte=None, matte_alpha=1.0,
-               file_for=None):
+               file_for=None, app_version=""):
     """items: [(num, note)]; get_image(frame) -> QImage; timecode(frame) -> str.
     Одна страница A4 (альбом) на комментарий: шапка + кадр с рисунком."""
     w = QtGui.QPdfWriter(path)
@@ -302,6 +376,7 @@ def export_pdf(path, items, get_image, file_label, timecode, progress=None, matt
             f.setBold(bold)
         return f
 
+    blurb = "Reviewed in MOOOV_player — a fast player for VFX review by mooov.team"  # если текста нет
     cap_h = H * 0.03              # капсула с номером кадра
     D = cap_h                     # кружок с номером — соразмерно лого справа и капсуле
     x0 = m + D + m * 0.4          # колонка текста справа от номера
@@ -338,32 +413,61 @@ def export_pdf(path, items, get_image, file_label, timecode, progress=None, matt
         r.setLeft(r.left() + fmc.horizontalAdvance(t1) + gap)
         p.drawText(r, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, t2)
         fname = file_for(note.frame) if file_for else file_label
-        meta = "   ·   ".join(x for x in (note.author, created_str(note), fname) if x)
+        app = f"MOOOV_player {app_version}".strip()
+        by = f"Recorded with {app} by {note.author}" if note.author else f"Recorded with {app}"
         # лого приложения (M + Play) справа вверху, по линии капсулы
         lh = cap_h * 0.7
         lw = lh * 2 + lh * 2 * ui.MARK_LEG + lh * 0.866
         paint_logo(p, QtCore.QRectF(W - m - lw, cap.center().y() - lh / 2, lw, lh), QtGui.QColor(ui.BRAND_YELLOW))
         mr = QtCore.QRectF(cap.right() + cap_h * 0.6, cap.top(), W - m - lw - cap_h * 1.2 - cap.right(), cap_h)
-        p.setPen(dim)
-        p.drawText(mr, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
-                   fms.elidedText(meta, QtCore.Qt.ElideMiddle, mr.width()))
+        fmeta = font(cap_h * 0.47, weight=QtGui.QFont.Light)  # служебная строка — тонким
+        if "Segoe UI Light" in QtGui.QFontDatabase.families():  # переменный Segoe UI в PDF вес не меняет
+            fmeta.setFamily("Segoe UI Light")
+        fkey = font(cap_h * 0.47, weight=QtGui.QFont.DemiBold)  # дата и файл — выделены
+        fml, fmk = QtGui.QFontMetricsF(fmeta), QtGui.QFontMetricsF(fkey)
+        sep = "   ·   "
+        parts = [(by, fmeta, fml, dim)] + [(t, fkey, fmk, fg) for t in (created_str(note), fname) if t]
+        # не влезает — сначала ужимаем имя файла (середину), потом подпись
+        for k in (len(parts) - 1, 0):
+            total = sum(mt.horizontalAdvance(t) for t, _, mt, _ in parts) + fml.horizontalAdvance(sep) * (len(parts) - 1)
+            over = total - mr.width()
+            if over > 0:
+                t, f_, mt, c = parts[k]
+                parts[k] = (mt.elidedText(t, QtCore.Qt.ElideMiddle, max(0.0, mt.horizontalAdvance(t) - over)), f_, mt, c)
+        x = mr.left()
+        for i_, (t, f_, mt, c) in enumerate(parts):
+            if i_:
+                p.setFont(fmeta)
+                p.setPen(dim)
+                p.drawText(QtCore.QRectF(x, mr.top(), max(0.0, mr.right() - x), mr.height()),
+                           QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, sep)
+                x += fml.horizontalAdvance(sep)
+            p.setFont(f_)
+            p.setPen(c)
+            p.drawText(QtCore.QRectF(x, mr.top(), max(0.0, mr.right() - x), mr.height()),
+                       QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, t)
+            x += mt.horizontalAdvance(t)
 
         # 3. сам комментарий — самый крупный и яркий
         text = note.text.strip()
         ty = cap.bottom() + H * 0.018
         maxh = H * 0.26
-        px = H * 0.034
+        if not text and note.strokes:
+            blurb_n = SKETCH_TEXT
+        else:
+            blurb_n = blurb
+        px = H * 0.034 if text else H * 0.022  # подпись плеера — тише настоящего комментария
         while True:
             ft = font(px, weight=QtGui.QFont.Medium)
             tr = QtGui.QFontMetricsF(ft).boundingRect(QtCore.QRectF(0, 0, tw, 10 * H), QtCore.Qt.TextWordWrap,
-                                                      text or "Drawing, no text")
+                                                      text or blurb_n)
             if tr.height() <= maxh or px <= H * 0.016:
                 break
             px *= 0.9
         p.setFont(ft)
         p.setPen(fg if text else muted)
         rt = QtCore.QRectF(x0, ty, tw, min(tr.height(), maxh) + 2)
-        p.drawText(rt, QtCore.Qt.TextWordWrap, text or "Drawing, no text")
+        p.drawText(rt, QtCore.Qt.TextWordWrap, text or blurb_n)
         bottom = max(rt.bottom(), m + D)
 
         # кадр со скруглёнными углами, рисунок без номера (номер уже в шапке)

@@ -1,6 +1,7 @@
 """Единая тема MOOOV_player: Fusion + тёмная палитра, одинаковые размеры контролов, векторные иконки."""
 import math
 import os
+import sys
 import tempfile
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -176,6 +177,18 @@ def apply(app):
         return
     app.setProperty("mooov_theme", True)
     app.setStyle("Fusion")
+    if sys.platform == "win32":
+        # Segoe UI с жёстким хинтингом выглядит рублено (особенно мелкий и повёрнутый текст).
+        # Segoe UI Variable (Windows 11) ближе к SF на Маке; без хинтинга — мягче, как на Маке.
+        fams = set(QtGui.QFontDatabase.families())
+        f = QtGui.QFont(app.font())
+        for fam in ("Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI"):
+            if fam in fams:
+                f.setFamily(fam)
+                break
+        f.setHintingPreference(QtGui.QFont.PreferNoHinting)
+        f.setStyleStrategy(QtGui.QFont.PreferAntialias)
+        app.setFont(f)
     pal = QtGui.QPalette()
     for role, c in ((QtGui.QPalette.Window, BG), (QtGui.QPalette.WindowText, TEXT), (QtGui.QPalette.Base, CONTROL),
                     (QtGui.QPalette.AlternateBase, SURFACE), (QtGui.QPalette.Text, TEXT), (QtGui.QPalette.Button, CONTROL),
@@ -187,9 +200,23 @@ def apply(app):
     app.setStyleSheet(stylesheet())
     app._popup_fix = _RoundPopups(app)
     app.installEventFilter(app._popup_fix)
+    # Windows: Qt по умолчанию «выкатывает» списки и меню. Анимация идёт в стандартной позиции (снизу),
+    # и только потом _place ставит список над кнопкой — список медленный и прыгает. Выключаем, как на Маке.
+    for fx in (QtCore.Qt.UI_AnimateCombo, QtCore.Qt.UI_AnimateMenu, QtCore.Qt.UI_FadeMenu):
+        app.setEffectEnabled(fx, False)
 
 
 ITEM_PAD = 10  # отступ текста в пунктах выпадающих списков
+
+
+def warm_popups(root):
+    """Окна выпадающих списков создаются при первом открытии — на Windows это ~0.25 с задержки
+    на каждом списке. Создаём их заранее, пока плеер простаивает после запуска."""
+    for combo in root.findChildren(QtWidgets.QComboBox):
+        cont = combo.view().parentWidget()
+        if cont is not None:
+            cont.ensurePolished()
+            cont.winId()
 
 
 class _RoundPopups(QtCore.QObject):

@@ -8,6 +8,7 @@ dependencies = [
     "opencv-python>=4.10",
     "numpy>=1.26",
     "OpenEXR>=3.3",
+    "opencolorio>=2.3",
 ]
 
 [dependency-groups]
