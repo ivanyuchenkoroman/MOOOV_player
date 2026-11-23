@@ -35,7 +35,7 @@ Developed by Ivaniuchenko Roman for [mooov.team](https://mooov.team).
 
 ## Install
 
-Download the Mac `.dmg` or the Windows setup from [Releases](../../releases). Builds are made by GitHub Actions when a `v*` tag is pushed, or by hand from the Actions tab.
+**[Download page](https://ivanyuchenkoroman.github.io/MOOOV_player/)** — Mac and Windows, always the latest version. All files are also in [Releases](../../releases). Builds are made by GitHub Actions when a `v*` tag is pushed, or by hand from the Actions tab.
 
 ## Run from source
 
