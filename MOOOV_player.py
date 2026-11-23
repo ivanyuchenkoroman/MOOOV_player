@@ -8,6 +8,7 @@ import os
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
 import argparse
+import io
 import math
 import re
 import sys
@@ -28,6 +29,10 @@ try:
     import OpenEXR  # запасной ридер для EXR, которые не открывает OpenCV
 except Exception:  # pragma: no cover
     OpenEXR = None
+try:
+    import PyOpenColorIO as OCIO  # показ через ACES / конфиг студии ($OCIO)
+except Exception:  # pragma: no cover
+    OCIO = None
 
 cv2.setNumThreads(1)  # параллелим сами, по кадрам
 
@@ -54,8 +59,13 @@ def find_sequence(path):
     return [(p, n) for n, p in items] or [(path, 0)]
 
 
+def _exr_src(src):
+    """Путь или байты файла (кадр, докачанный по сети) — для OpenEXR.File."""
+    return io.BytesIO(src) if isinstance(src, (bytes, bytearray)) else src
+
+
 def read_exr_fallback(path):
-    with OpenEXR.File(path) as f:
+    with OpenEXR.File(_exr_src(path)) as f:
         ch = f.channels()
         for key in ("RGBA", "RGB"):
             if key in ch:
@@ -89,7 +99,17 @@ def _exr_sorted(chans):
     return sorted(chans, key=lambda c: (_CH_ORDER.get(c.rsplit(".", 1)[-1].lower(), 9), c))
 
 
+_LAYERS = {}
+
+
 def exr_layers(path):
+    """Имена слоёв EXR (запоминаются — меню каналов не лезет каждый раз в сеть)."""
+    if path not in _LAYERS:
+        _LAYERS[path] = _exr_layers(path)
+    return list(_LAYERS[path])
+
+
+def _exr_layers(path):
     """Имена слоёв EXR: основной первым, дальше по алфавиту. [] — если файл не EXR или не читается."""
     if OpenEXR is None or not path.lower().endswith(".exr"):
         return []
@@ -99,18 +119,37 @@ def exr_layers(path):
     except Exception:
         return []
     g = _exr_groups(names)
-    return ([BASE_LAYER] if BASE_LAYER in g else []) + sorted((k for k in g if k != BASE_LAYER), key=str.lower)
+    out = []
+    for k, chans in g.items():
+        if k == BASE_LAYER:
+            continue
+        odd = [c for c in chans if not _std_chan(c)]  # кастомные каналы (маски: masks.hair, masks.sky …)
+        if len(chans) == 1 or not odd:
+            out.append(k)
+            continue
+        if len(odd) < len(chans):
+            out.append(k)  # стандартная часть слоя (R G B A) — как обычно
+        out += odd  # каждая кастомная маска — отдельным пунктом, серым
+    return ([BASE_LAYER] if BASE_LAYER in g else []) + sorted(out, key=str.lower)
+
+
+def _std_chan(c):
+    """Канал с обычным суффиксом (R G B A, X Y Z, U V W …) — собирается в цвет вместе с соседями."""
+    return c.rsplit(".", 1)[-1].lower() in _CH_ORDER
 
 
 def read_exr_layer(path, layer):
     """Кадр одного слоя EXR (AOV) как float32: 1 канал — серый, 2 — RG + пустой B, 3–4 — RGB(A)."""
-    with OpenEXR.File(path, separate_channels=True) as f:
+    with OpenEXR.File(_exr_src(path), separate_channels=True) as f:
         ch = {}
         for part in f.parts:
             ch.update(part.channels)
+        if layer in ch:  # один канал по полному имени (маска) — серым
+            return np.ascontiguousarray(np.asarray(ch[layer].pixels, dtype=np.float32))
         chans = _exr_groups(ch).get(layer)
         if not chans:
             return None
+        chans = [c for c in chans if _std_chan(c)] or chans  # кастомные маски слоя — отдельными пунктами
         chans = _exr_sorted(chans)
         planes = [np.asarray(ch[c].pixels, dtype=np.float32) for c in chans[:4]]
     if len(chans) > 4 or (len(chans) == 4 and chans[3].rsplit(".", 1)[-1].lower() not in ("a", "alpha")):
@@ -122,18 +161,23 @@ def read_exr_layer(path, layer):
     return np.ascontiguousarray(np.dstack(planes))
 
 
-def read_image(path, layer=None):
-    """Кадр как numpy. layer — слой EXR (AOV); если его нет в файле — основной."""
+def read_image(path, layer=None, data=None):
+    """Кадр как numpy. layer — слой EXR (AOV); если его нет в файле — основной.
+    data — байты файла, если он уже докачан по сети (тогда диск/сеть не трогаем)."""
+    src = path if data is None else data
     if layer and layer != BASE_LAYER and OpenEXR is not None and path.lower().endswith(".exr"):
         try:
-            a = read_exr_layer(path, layer)
+            a = read_exr_layer(src, layer)
         except Exception:
             a = None
         if a is not None:
             return a
-    a = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if data is None:
+        a = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    else:
+        a = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
     if a is None and path.lower().endswith(".exr") and OpenEXR is not None:
-        return read_exr_fallback(path)  # уже RGB(A)
+        return read_exr_fallback(src)  # уже RGB(A)
     if a is None:
         raise IOError("cannot read " + path)
     if a.ndim == 3:
@@ -166,8 +210,8 @@ def exr_details(path):
     if OpenEXR is None:
         return None
     try:
-        with OpenEXR.File(path) as f:
-            comp = str(f.header().get("compression", "")).split(".")[-1].replace("_COMPRESSION", "")
+        with OpenEXR.File(_exr_src(path)) as f:
+            comp =str(f.header().get("compression", "")).split(".")[-1].replace("_COMPRESSION", "")
             chans = f.channels()
             dt = next(iter(chans.values())).pixels.dtype
             return comp, DTYPE_BITS.get(str(dt), str(dt)), ", ".join(chans.keys())
@@ -211,17 +255,65 @@ APP_VERSION = "1.1.0"
 AUTHOR = "Ivaniuchenko Roman"
 SITE = "mooov.team"
 SITE_URL = "https://mooov.team"
+SKETCH_TEXT = ann.SKETCH_TEXT  # подпись рисунка без текста (сам текст пустой — печатаешь сразу своё)
 CREDITS = f"Developed by {AUTHOR} for {SITE}"
 SPEEDS = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0)
 MAX_DISPLAY_FPS = 60  # быстрее экран не показывает — на 2×/4× пропускаем кадры, время остаётся точным
 
 
+def seq_size(items):
+    """Размер секвенции одним листингом папки (по сети stat на каждый файл — минута на 200 кадров)."""
+    want = {os.path.normcase(os.path.basename(p)) for p, _ in items}
+    dirs = {os.path.dirname(p) for p, _ in items}
+    total = 0
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if os.path.normcase(e.name) in want and e.is_file():
+                        total += e.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+_REMOTE = {}
+
+
+def is_remote(path):
+    """Файл на сетевом диске / шаре: такие кадры сначала докачиваем кусками (можно приостановить),
+    потом декодируем уже из кэша системы — смена канала / AOV не качает файлы заново."""
+    p = os.path.abspath(path)
+    if p.startswith(("\\\\", "//")):
+        return True
+    root = os.path.splitdrive(p)[0] if sys.platform == "win32" else "/".join(p.split("/")[:3])
+    if root not in _REMOTE:
+        r = False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                r = ctypes.windll.kernel32.GetDriveTypeW(root + "\\") == 4  # DRIVE_REMOTE
+            except Exception:
+                pass
+        else:
+            r = p.startswith(("/Volumes/", "/mnt/", "/net/"))
+        _REMOTE[root] = r
+    return _REMOTE[root]
+
+
+# потоков чтения: больше — только толкотня за GIL; по сети упираемся в канал, хватает 4
+LOCAL_THREADS = max(2, min(8, (os.cpu_count() or 4) - 2))
+REMOTE_THREADS = 4
+
+
 class SequenceSource:
-    threads = max(2, (os.cpu_count() or 4) - 2)
+    threads = LOCAL_THREADS
 
     def __init__(self, path):
         self.items = find_sequence(path)
         self.n = len(self.items)
+        self.remote = is_remote(self.items[0][0])
+        self.threads = REMOTE_THREADS if self.remote else LOCAL_THREADS
         self.fps = 24.0
         first, last = self.items[0][1], self.items[-1][1]
         base = os.path.basename(self.items[0][0])
@@ -244,27 +336,39 @@ class SequenceSource:
     def info(self):
         first = self.items[0][0]
         ext = os.path.splitext(first)[1].lower()
-        a = read_image(first)
+        with open(first, "rb") as fh:  # байты читаем сами: OpenEXR по сети держит GIL и морозит интерфейс
+            data = fh.read()
+        a = read_image(first, data=data)
         h, w = a.shape[:2]
         ch = 1 if a.ndim == 2 else a.shape[2]
         fmt = FORMAT_NAMES.get(ext, ext[1:].upper())
         bits = DTYPE_BITS.get(str(a.dtype), str(a.dtype))
         chans = channel_names(ch)
         if ext == ".exr":
-            d = exr_details(first)
+            d = exr_details(data)
             if d:
                 fmt += f" · {d[0]}"
                 bits, chans = d[1], d[2]
         lo, hi = self.numbers[0], self.numbers[-1]
         missing = (hi - lo + 1) - self.n
-        size = sum(os.path.getsize(p) for p, _ in self.items if os.path.exists(p))
+        size = seq_size(self.items)
         return {"name": self.file_label, "path": os.path.dirname(first), "format": fmt,
                 "w": w, "h": h, "bits": f"{bits} · {chans}",
                 "range": f"{lo}–{hi}" + (f"   ({missing} missing)" if missing > 0 else ""),
                 "size": human_size(size)}
 
-    def read(self, i, layer=None):
-        return read_image(self.items[i][0], layer)
+    def read(self, i, layer=None, data=None):
+        return read_image(self.items[i][0], layer, data)
+
+    def remote_path(self, i):
+        """Путь кадра, если он по сети (его надо сначала докачать), иначе None."""
+        return self.items[i][0] if self.remote else None
+
+    def color_space(self, i=0):
+        """Пространство ACES секвенции по заголовку первого кадра (один раз)."""
+        if not hasattr(self, "_cs"):
+            self._cs = exr_aces_space(self.items[0][0])
+        return self._cs
 
 
 class VideoSource:
@@ -351,9 +455,18 @@ class CompositeSource:
         k = max(0, self._bisect(self.offsets, i) - 1)
         return k, i - self.offsets[k]
 
-    def read(self, i, layer=None):
+    def read(self, i, layer=None, data=None):
         k, j = self.locate(i)
-        return self.clips[k].read(j, layer)
+        return self.clips[k].read(j, layer) if data is None else self.clips[k].read(j, layer, data)
+
+    def remote_path(self, i):
+        k, j = self.locate(i)
+        c = self.clips[k]
+        return c.remote_path(j) if hasattr(c, "remote_path") else None
+
+    def color_space(self, i):
+        c = self.clips[self.locate(i)[0]]
+        return c.color_space(0) if hasattr(c, "color_space") else None
 
     def is_linear(self, i):
         return self.clips[self.locate(i)[0]].linear
@@ -444,6 +557,93 @@ def srgb_lut():
     return _SRGB_LUT
 
 
+# ---- OCIO: встроенные конфиги ACES (файлы не нужны) + конфиг студии из переменной $OCIO
+OCIO_ACES1 = "ocio://studio-config-v2.2.0_aces-v1.3_ocio-v2.4"  # ACES 1.3 — как в Nuke / Resolve по умолчанию
+
+
+def exr_aces_space(path):
+    """'ACES2065-1' / 'ACEScg' по заголовку EXR; None — не понять (тогда ACEScg)."""
+    if OpenEXR is None or not path.lower().endswith(".exr"):
+        return None
+    try:  # без with: внутри него OpenEXR 3.5 отдаёт chromaticities = None
+        h = dict(OpenEXR.File(path, header_only=True).header())
+    except Exception:
+        return None
+    ch = h.get("chromaticities")
+    if ch is not None:
+        try:
+            rx, ry, gx, gy = (float(v) for v in tuple(ch)[:4])
+        except Exception:
+            rx = ry = gx = gy = -1
+        if abs(rx - 0.7347) < 2e-3 and abs(ry - 0.2653) < 2e-3 and abs(gx) < 2e-3 and abs(gy - 1) < 2e-3:
+            return "ACES2065-1"  # AP0 — так пишет Write в Nuke с ACES-контейнером
+        if abs(rx - 0.713) < 2e-3 and abs(ry - 0.293) < 2e-3:
+            return "ACEScg"  # AP1
+    if h.get("acesImageContainerFlag"):
+        return "ACES2065-1"
+    return None
+_OCIO_LOCK = threading.Lock()
+_OCIO_CFG, _OCIO_PROC, _OCIO_VIEWS = {}, {}, None
+
+
+def _ocio_config(path):
+    if path not in _OCIO_CFG:
+        _OCIO_CFG[path] = OCIO.Config.CreateFromFile(path)
+    return _OCIO_CFG[path]
+
+
+def ocio_views():
+    """Режимы показа через OCIO: подпись -> (конфиг, дисплей, вид). ACES 1 / ACES 2 / без тонмаппинга
+    для мониторов sRGB и Rec.709, плюс виды дисплея по умолчанию из конфига студии ($OCIO)."""
+    global _OCIO_VIEWS
+    if _OCIO_VIEWS is None:
+        v = {}
+        if OCIO is not None:
+            # один пункт = вход EXR -> монитор, через ACES 1.0 SDR Video (как вьювер Nuke в ACES 1.x)
+            for disp, tag in (("sRGB - Display", "sRGB"), ("Rec.1886 Rec.709 - Display", "Rec.709")):
+                for inp in ("ACEScg", "ACES2065-1"):
+                    v[f"{inp} → {tag}"] = (OCIO_ACES1, disp, "ACES 1.0 - SDR Video", inp)
+            env = os.environ.get("OCIO")
+            if env:
+                try:
+                    c = _ocio_config(env)
+                    d = c.getDefaultDisplay()
+                    for vw in c.getViews(d):
+                        v[f"OCIO · {vw}"] = (env, d, vw, "scene_linear")
+                except Exception:
+                    pass
+        _OCIO_VIEWS = v
+    return _OCIO_VIEWS
+
+
+def ocio_processor(view, src=None):
+    """CPU-процессор «вход -> дисплей». Точный ACES на 2K — 0.5–1.8 с на кадр, поэтому запекаем его
+    в 3D LUT 65³ на логарифмическом шейпере ACEScct (как RV / Nuke): ~85 мс, ошибка в среднем < 0.5/255."""
+    key = (view, src)
+    with _OCIO_LOCK:
+        if key in _OCIO_PROC:
+            return _OCIO_PROC[key]
+        cfg, disp, vw, name = ocio_views()[view]
+        c = _ocio_config(cfg)
+        if c.getColorSpace(name) is None:
+            name = "scene_linear"  # в конфиге студии такого нет — его рабочее линейное
+        if c.getColorSpace("ACEScct") is not None:
+            n = 65
+            g = np.linspace(0, 1, n, dtype=np.float32)
+            r_, g_, b_ = np.meshgrid(g, g, g, indexing="ij")  # порядок Lut3D OCIO: синий меняется быстрее всех
+            grid = np.ascontiguousarray(np.stack([r_, g_, b_], -1).reshape(-1, 3))
+            c.getProcessor(OCIO.DisplayViewTransform(src="ACEScct", display=disp, view=vw)
+                           ).getDefaultCPUProcessor().applyRGB(grid)
+            lut = OCIO.Lut3DTransform(gridSize=n)
+            lut.setData(grid.ravel())
+            lut.setInterpolation(OCIO.INTERP_TETRAHEDRAL)
+            proc = c.getProcessor(OCIO.GroupTransform([OCIO.ColorSpaceTransform(src=name, dst="ACEScct"), lut]))
+        else:
+            proc = c.getProcessor(OCIO.DisplayViewTransform(src=name, display=disp, view=vw))
+        cpu = _OCIO_PROC[key] = proc.getDefaultCPUProcessor()
+        return cpu
+
+
 # каше (маска формата кадра): подпись -> соотношение сторон
 MATTES = {"No matte": None, "2.39:1": 2.39, "2.35:1": 2.35, "2:1": 2.0, "1.85:1": 1.85,
           "16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "4:5": 0.8, "9:16": 9 / 16}
@@ -476,8 +676,20 @@ def to_qimage(a, params, linear, alpha=False):
         x = a[:, :, sel if c > sel else 0]
 
     is_float = a.dtype.kind == "f"
-    use_srgb = is_float and linear and view == "sRGB" and sel != 3
-    if a.dtype == np.uint8 and exposure == 0:
+    ocio = view in ocio_views() and is_float and linear
+    use_srgb = is_float and linear and view != "Linear" and sel != 3  # OCIO-вид: отдельные каналы — как в sRGB
+    if ocio and sel is None:  # RGB через OCIO: экспозиция в сцене, потом вход -> дисплей
+        f = np.array(x, dtype=np.float32, order="C")
+        if exposure:
+            f *= 2.0 ** exposure
+        try:
+            ocio_processor(view).applyRGB(f)
+        except Exception:  # pragma: no cover — сломанный конфиг: хотя бы sRGB
+            np.clip(f, 0, 1, out=f)
+            f = srgb_lut()[(f * 4095).astype(np.uint16)].astype(np.float32) / 255
+        np.clip(f, 0, 1, out=f)
+        out = (f * 255 + 0.5).astype(np.uint8)
+    elif a.dtype == np.uint8 and exposure == 0:
         out = x
     else:
         f = x.astype(np.float32)
@@ -513,7 +725,10 @@ class Bridge(QtCore.QObject):
 
 
 class Loader:
-    """Пул потоков, который грузит кадры вперёд от плейхеда в кэш с лимитом по памяти."""
+    """Пул потоков, который грузит кадры вперёд от плейхеда в кэш с лимитом по памяти.
+    Сетевые кадры — в два шага: файл докачивается кусками (warm), потом декодируется.
+    На паузе кадр под плейхедом важнее всего: пока его нет, остальные докачки стоят."""
+    playing = False  # Player ставит на Play / Stop: при проигрывании качаем всеми потоками подряд
 
     def __init__(self, source, budget_bytes, params, alpha=False):
         self.src = source
@@ -525,6 +740,9 @@ class Loader:
         self.cache = {}  # idx -> QImage | Exception
         self.used = 0
         self.inflight = set()
+        self.raw = {}  # сетевые кадры: idx -> байты файла (AOV / канал / EV меняем без повторной закачки)
+        self.raw_used = 0
+        self.partial = {}  # недокачанные (уступили кадру под плейхедом): idx -> куски
         self.playhead = 0
         self.gen = 0
         self.frame_bytes = 0
@@ -564,6 +782,7 @@ class Loader:
         with self.cond:
             self.budget = budget_bytes
             self._evict()
+            self._evict_raw()
             self.cond.notify_all()
 
     def close(self):
@@ -592,6 +811,52 @@ class Loader:
             if isinstance(img, QtGui.QImage):
                 self.used -= img.sizeInBytes()
 
+    def _urgent(self):
+        """На паузе кадр под плейхедом ещё не готов — весь канал ему."""
+        return not Loader.playing and self.playhead not in self.cache
+
+    def _evict_raw(self):
+        """Байты сетевых кадров держим в половине бюджета памяти; дальние от плейхеда — вон."""
+        ph, n = self.playhead, self.n
+        while self.raw_used > self.budget // 2 and len(self.raw) > 1:
+            victim = max(self.raw, key=lambda f: (f - ph) % n)
+            self.raw_used -= len(self.raw.pop(victim))
+        while len(self.partial) > 16:
+            self.partial.pop(max(self.partial, key=lambda f: (f - ph) % n))
+
+    def _fetch(self, f, path):
+        """Докачать файл кадра в память кусками по 1 МБ (GIL при этом свободен — интерфейс не стоит).
+        Пока ждём кадр под плейхедом — стоим; если его некому взять — уступаем поток,
+        докачанное запоминаем и потом продолжаем с того же места.
+        Байты файла; b"" — не читается (ошибку покажет декодер); None — уступили / закрыто."""
+        with self.cond:
+            chunks = self.partial.pop(f, [])
+        try:
+            with open(path, "rb", buffering=0) as fh:
+                if chunks:
+                    fh.seek(sum(len(c) for c in chunks))
+                while True:
+                    with self.cond:
+                        while self.alive and f != self.playhead and self._urgent():
+                            if self.playhead not in self.inflight:
+                                self.partial[f] = chunks
+                                return None
+                            self.cond.wait(0.5)
+                        if not self.alive:
+                            return None
+                    b = fh.read(1 << 20)
+                    if not b:
+                        break
+                    chunks.append(b)
+        except OSError:
+            return b""
+        data = b"".join(chunks)
+        with self.cond:
+            self.raw[f] = data
+            self.raw_used += len(data)
+            self._evict_raw()
+        return data
+
     def _work(self):
         while True:
             with self.cond:
@@ -600,15 +865,27 @@ class Loader:
                 if not self.alive:
                     return
                 self.inflight.add(f)
+                data = self.raw.get(f)
+            path = None if data is not None else getattr(self.src, "remote_path", lambda _: None)(f)
+            if path:
+                data = self._fetch(f, path)
+                if data is None:
+                    with self.cond:
+                        self.inflight.discard(f)
+                        self.cond.notify_all()
+                    continue
+            with self.cond:  # параметры — после докачки: AOV могли сменить, пока файл шёл
                 gen, params = self.gen, self.params
             try:
                 lin = self.src.is_linear(f) if hasattr(self.src, "is_linear") else self.src.linear
                 layer = params[4] if len(params) > 4 else None
-                img = to_qimage(self.src.read(f, layer) if layer else self.src.read(f), params, lin, self.alpha)
+                a = self.src.read(f, layer, data) if data else (self.src.read(f, layer) if layer else self.src.read(f))
+                img = to_qimage(a, params, lin, self.alpha)
             except Exception as e:  # битый / отсутствующий кадр
                 img = e
             with self.cond:
                 self.inflight.discard(f)
+                self.cond.notify_all()  # кадр плейхеда готов — отпускаем остальные докачки
                 if gen != self.gen or not self.alive:
                     continue
                 self.cache[f] = img
@@ -620,6 +897,104 @@ class Loader:
 
 
 # --------------------------------------------------------------------------- widgets
+
+
+def paint_info_box(p, rows, origin, font, max_w, bg_alpha=105, draw=True):
+    """Плашка инфо (как на кадре): подписи слева, значения справа; Name — жирным, Path — жёлтым.
+    Возвращает (рамка плашки, рамка пути или None). draw=False — только посчитать размер."""
+    f = QtGui.QFont(font)
+    f.setPixelSize(12)
+    fb = QtGui.QFont(f)
+    fb.setBold(True)
+    fm, fmb = QtGui.QFontMetricsF(f), QtGui.QFontMetricsF(fb)
+    pad, gap, lh = 10, 12, fm.height() + 3
+    lw = max(fm.horizontalAdvance(k) for k, _ in rows)
+    maxv = max(120, min(520, max_w - 2 * pad - lw - gap))
+    vals = []
+    for k, v in rows:
+        fnt = fmb if k == "Name" else fm
+        mode = QtCore.Qt.ElideMiddle if k in ("Path", "Name", "File") else QtCore.Qt.ElideRight
+        vals.append(fnt.elidedText(v, mode, maxv))
+    vw = max(max(fmb.horizontalAdvance(v), fm.horizontalAdvance(v)) for v in vals)
+    box = QtCore.QRectF(origin.x(), origin.y(), 2 * pad + lw + gap + vw, 2 * pad + lh * len(vals) - 3)
+    path_rect = None
+    y = box.top() + pad
+    if draw:
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 14), 1))
+        bgc = QtGui.QColor(ui.BG)
+        bgc.setAlpha(bg_alpha)
+        p.setBrush(bgc)
+        p.drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), ui.RADIUS_CARD, ui.RADIUS_CARD)
+        p.setOpacity(0.75)  # данные приглушены — 75% видимости
+    for (k, _), v in zip(rows, vals):
+        vr = QtCore.QRectF(box.left() + pad + lw + gap, y, vw, lh)
+        if k == "Path":
+            path_rect = QtCore.QRectF(vr.left(), y, fm.horizontalAdvance(v), lh)
+        if draw:
+            p.setFont(f)
+            p.setPen(QtGui.QColor(ui.DIM))
+            p.drawText(QtCore.QRectF(box.left() + pad, y, lw, lh), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, k)
+            if k == "Name":
+                p.setFont(fb)
+            p.setPen(QtGui.QColor(ui.ACCENT if k == "Path" else ui.TEXT))
+            p.drawText(vr, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, v)
+        y += lh
+    if draw:
+        p.setOpacity(1.0)
+    return box, path_rect
+
+
+class InfoPopup(QtWidgets.QWidget):
+    """Плашка инфо слоя — всплывает над кнопкой ⓘ на полоске, в том же виде, что инфо кадра.
+    Клик мимо или по той же кнопке — закрывается; клик по пути — папка с файлом."""
+    closed = QtCore.Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint | QtCore.Qt.NoDropShadowWindowHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setAttribute(QtCore.Qt.WA_NoMouseReplay)  # клик по той же ⓘ только закрывает
+        self.setMouseTracking(True)
+        self.rows, self.path, self._path_rect = [], "", None
+
+    def show_rows(self, rows, path, anchor):
+        """anchor — глобальная точка над кнопкой: левый нижний угол плашки."""
+        self.rows, self.path = rows, path
+        box, _ = paint_info_box(None, rows, QtCore.QPointF(0, 0), self.font(), 640, draw=False)
+        self.resize(int(box.width()) + 1, int(box.height()) + 1)
+        scr = (QtGui.QGuiApplication.screenAt(anchor) or QtGui.QGuiApplication.primaryScreen()).availableGeometry()
+        x = max(scr.left() + 4, min(anchor.x(), scr.right() - self.width() - 4))
+        y = anchor.y() - self.height()
+        if y < scr.top() + 4:
+            y = anchor.y() + 24  # над кнопкой не влезло — под ней
+        self.move(x, y)
+        self.show()
+
+    def paintEvent(self, e):
+        p = QtGui.QPainter(self)
+        _, self._path_rect = paint_info_box(p, self.rows, QtCore.QPointF(0, 0), self.font(), 640, bg_alpha=235)
+        p.end()
+
+    def mouseMoveEvent(self, e):
+        on = bool(self.path and self._path_rect and self._path_rect.contains(e.position()))
+        self.setCursor(QtCore.Qt.PointingHandCursor if on else QtCore.Qt.ArrowCursor)
+        self.setToolTip("Show in folder" if on else "")
+
+    def mousePressEvent(self, e):
+        if self.path and self._path_rect and self._path_rect.contains(e.position()):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self.path))
+        self.close()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.closed.emit()
+
+
+def popup_above(menu, anchor):
+    """Меню над точкой anchor (верх кнопки); не влезает сверху — Qt сам опустит."""
+    menu.ensurePolished()
+    h = menu.sizeHint().height()
+    menu.exec(QtCore.QPoint(anchor.x(), anchor.y() - h))
 
 
 def clear_focus():
@@ -665,6 +1040,7 @@ class NoteBubble(QtWidgets.QFrame):
     Enter — сохранить, Shift+Enter — новая строка, Esc — отменить правку."""
     changed = QtCore.Signal(object)
     done = QtCore.Signal(object)
+    entered = QtCore.Signal(object)  # закончили Enter-ом — комментарий готов, новые штрихи уже не в него
     W = 300
 
     def __init__(self, parent):
@@ -680,17 +1056,20 @@ class NoteBubble(QtWidgets.QFrame):
         v.setContentsMargins(12, 9, 12, 8)
         v.setSpacing(4)
         self.head = QtWidgets.QLabel()
-        self.head.setStyleSheet(f"color:{ui.NOTE}; font-size:11px;")
+        self.head.setStyleSheet(f"color:{ui.NOTE}; font-size:12px; font-weight:600;")
         self.edit = QtWidgets.QTextEdit()
         self.edit.setAcceptRichText(False)
         self.edit.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.edit.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.edit.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.edit.setPlaceholderText("Type a comment…")
-        self.edit.setStyleSheet(f"background: transparent; border: none; padding: 0; color: {ui.TEXT}; font-size: 13px;")
+        self.edit.setStyleSheet(f"background: transparent; border: none; padding: 0; color: {ui.TEXT}; font-size: 14px;")
         self.edit.document().setDocumentMargin(1)
-        self.hint = QtWidgets.QLabel("↵ save   ·   ⇧↵ new line   ·   esc cancel")
-        self.hint.setStyleSheet(f"color:{ui.DIM}; font-size:10px;")
+        key = f"<span style='color:{ui.TEXT}; font-weight:600'>{{}}</span>"
+        self.hint = QtWidgets.QLabel("&nbsp;&nbsp;·&nbsp;&nbsp;".join(
+            f"{key.format(k)} {t}" for k, t in (("Enter", "save"), ("Shift+Enter", "new line"), ("Esc", "cancel"))))
+        self.hint.setTextFormat(QtCore.Qt.RichText)
+        self.hint.setStyleSheet(f"color:{ui.DIM}; font-size:11px;")
         for w in (self.head, self.edit, self.hint):
             v.addWidget(w)
         self.setFixedWidth(self.W)
@@ -744,11 +1123,117 @@ class NoteBubble(QtWidgets.QFrame):
                     self.close_edit(cancel=True)
                     return True
                 if enter and not e.modifiers() & QtCore.Qt.ShiftModifier:
+                    n = self.note
                     self.close_edit()
+                    self.entered.emit(n)
                     return True
             elif e.type() == QtCore.QEvent.FocusOut:
                 self.close_edit()
         return False
+
+
+class WinTab:
+    """Нажим пера через Wintab (драйвер Wacom) напрямую. Qt 6 на Windows берёт перо только через
+    Windows Ink; если в настройках Wacom Windows Ink выключен (так часто делают ради Photoshop/Nuke),
+    Qt видит перо как мышь и нажима нет. Тогда читаем очередь пакетов Wintab сами."""
+    PK_BUTTONS, PK_NORMAL_PRESSURE = 0x0040, 0x0400
+    WTI_DEFSYSCTX, WTI_DEVICES, DVC_NPRESSURE = 4, 100, 15
+
+    def __init__(self, hwnd):
+        import ctypes
+        from ctypes import wintypes as W
+        self.ct = ctypes
+        self.ctx = None
+        self.max_p = 0
+        dll = ctypes.WinDLL(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wintab32.dll"))
+        self.dll = dll
+
+        class LOGCONTEXTW(ctypes.Structure):
+            _fields_ = [("lcName", W.WCHAR * 40)] + [(n, W.UINT) for n in (
+                "lcOptions", "lcStatus", "lcLocks", "lcMsgBase", "lcDevice", "lcPktRate")] + [(n, W.DWORD) for n in (
+                "lcPktData", "lcPktMode", "lcMoveMask", "lcBtnDnMask", "lcBtnUpMask")] + [(n, W.LONG) for n in (
+                "lcInOrgX", "lcInOrgY", "lcInOrgZ", "lcInExtX", "lcInExtY", "lcInExtZ",
+                "lcOutOrgX", "lcOutOrgY", "lcOutOrgZ", "lcOutExtX", "lcOutExtY", "lcOutExtZ")] + [
+                (n, W.DWORD) for n in ("lcSensX", "lcSensY", "lcSensZ")] + [("lcSysMode", W.BOOL)] + [
+                (n, ctypes.c_int) for n in ("lcSysOrgX", "lcSysOrgY", "lcSysExtX", "lcSysExtY")] + [
+                (n, W.DWORD) for n in ("lcSysSensX", "lcSysSensY")]
+
+        class AXIS(ctypes.Structure):
+            _fields_ = [("axMin", W.LONG), ("axMax", W.LONG), ("axUnits", W.UINT), ("axResolution", W.DWORD)]
+
+        class PACKET(ctypes.Structure):  # поля в порядке битов PK_*: кнопки, затем нажим
+            _fields_ = [("buttons", W.DWORD), ("pressure", W.UINT)]
+
+        self.PACKET = PACKET
+        dll.WTInfoW.argtypes = [W.UINT, W.UINT, ctypes.c_void_p]
+        dll.WTInfoW.restype = W.UINT
+        dll.WTOpenW.argtypes = [W.HWND, ctypes.c_void_p, W.BOOL]
+        dll.WTOpenW.restype = W.HANDLE
+        dll.WTPacketsGet.argtypes = [W.HANDLE, ctypes.c_int, ctypes.c_void_p]
+        dll.WTPacketsGet.restype = ctypes.c_int
+        dll.WTQueueSizeSet.argtypes = [W.HANDLE, ctypes.c_int]
+        dll.WTOverlap.argtypes = [W.HANDLE, W.BOOL]
+        dll.WTClose.argtypes = [W.HANDLE]
+        if not dll.WTInfoW(0, 0, None):
+            raise OSError("wintab: no tablet service")
+        ax = AXIS()
+        dll.WTInfoW(self.WTI_DEVICES, self.DVC_NPRESSURE, ctypes.byref(ax))
+        self.max_p = max(1, ax.axMax)
+        lc = LOGCONTEXTW()
+        dll.WTInfoW(self.WTI_DEFSYSCTX, 0, ctypes.byref(lc))
+        lc.lcName = "MOOOV_player"
+        lc.lcPktData = self.PK_BUTTONS | self.PK_NORMAL_PRESSURE
+        lc.lcPktMode = 0
+        lc.lcMoveMask = self.PK_BUTTONS | self.PK_NORMAL_PRESSURE
+        lc.lcBtnUpMask = lc.lcBtnDnMask
+        self.ctx = dll.WTOpenW(hwnd, ctypes.byref(lc), True)
+        if not self.ctx:
+            raise OSError("wintab: WTOpen failed")
+        for n in (256, 128, 64, 32):
+            if dll.WTQueueSizeSet(self.ctx, n):
+                break
+        self.buf = (PACKET * 256)()
+
+    def pressure(self):
+        """Нажим последнего пакета 0..1, None — пакетов нет (мышь, перо далеко)."""
+        if not self.ctx:
+            return None
+        self.dll.WTOverlap(self.ctx, True)  # контекст наверх — пакеты идут нам
+        last = None
+        while True:  # выбрать очередь до конца — нужен самый свежий пакет
+            n = self.dll.WTPacketsGet(self.ctx, len(self.buf), self.buf)
+            if n <= 0:
+                break
+            last = self.buf[n - 1].pressure
+            if n < len(self.buf):
+                break
+        if not last:
+            return None
+        return min(1.0, last / self.max_p)
+
+    def flush(self):
+        if self.ctx:
+            self.dll.WTPacketsGet(self.ctx, len(self.buf), None)
+
+    def close(self):
+        if self.ctx:
+            self.dll.WTClose(self.ctx)
+            self.ctx = None
+
+
+_WINTAB = None  # WinTab | False (нет драйвера) | None (не пробовали)
+
+
+def wintab(widget):
+    global _WINTAB
+    if _WINTAB is None:
+        _WINTAB = False
+        if sys.platform == "win32" and os.environ.get("MOOOV_WINTAB", "1") != "0":
+            try:
+                _WINTAB = WinTab(int(widget.window().winId()))
+            except Exception as e:
+                print("MOOOV_player: wintab off:", e)
+    return _WINTAB or None
 
 
 class Viewer(QOpenGLWidget):
@@ -790,6 +1275,9 @@ class Viewer(QOpenGLWidget):
         self.matte = None  # соотношение сторон каше или None
         self.matte_alpha = 1.0
         self.live = None
+        self._pen_p = None  # нажим пера (Wacom и др.), пока перо касается; None — мышь
+        self._wt_p = None  # то же через Wintab, если Qt нажима не даёт
+        self._nav = None  # ("pan" | "zoom", точка, исходный масштаб) — Shift/Ctrl + тянуть
         self._last_wp = None
         self.info = None  # [(label, value)] — плашка с информацией о файле
         self.info_path = None  # папка, открывается кликом по строке Path
@@ -1169,7 +1657,7 @@ class Viewer(QOpenGLWidget):
         fb = QtGui.QFont(self.font())
         fb.setPixelSize(13)
         head = "  ·  ".join(x for x in (f"{num}", note.author, f"frame {note.number}", ann.created_str(note)) if x)
-        body = note.text.strip() or "drawing, no text yet"
+        body = note.text.strip() or SKETCH_TEXT
         pad, maxw = 10, 320
         fmh, fmb = QtGui.QFontMetricsF(f), QtGui.QFontMetricsF(fb)
         br = fmb.boundingRect(QtCore.QRectF(0, 0, maxw, 2000), QtCore.Qt.TextWordWrap, body)
@@ -1199,46 +1687,7 @@ class Viewer(QOpenGLWidget):
 
     def _paint_info(self, p):
         """Полупрозрачная плашка в левом верхнем углу: подписи слева, значения справа."""
-        f = QtGui.QFont(self.font())
-        f.setPixelSize(12)
-        fb = QtGui.QFont(f)
-        fb.setBold(True)
-        fm, fmb = QtGui.QFontMetricsF(f), QtGui.QFontMetricsF(fb)
-        pad, gap, lh = 10, 12, fm.height() + 3
-        lw = max(fm.horizontalAdvance(k) for k, _ in self.info)
-        maxv = max(120, min(520, self.width() - 24 - 2 * pad - lw - gap))
-        vals = []
-        for k, v in self.info:
-            fnt = fmb if k == "Name" else fm
-            mode = QtCore.Qt.ElideMiddle if k in ("Path", "Name", "File") else QtCore.Qt.ElideRight
-            vals.append(fnt.elidedText(v, mode, maxv))
-        vw = max(max(fmb.horizontalAdvance(v), fm.horizontalAdvance(v)) for v in vals)
-        box = QtCore.QRectF(12, 12, 2 * pad + lw + gap + vw, 2 * pad + lh * len(vals) - 3)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 14), 1))
-        bgc = QtGui.QColor(ui.BG)
-        bgc.setAlpha(105)  # подложка вдвое прозрачнее прежней (было 210)
-        p.setBrush(bgc)
-        p.drawRoundedRect(box, ui.RADIUS_CARD, ui.RADIUS_CARD)
-        p.setOpacity(0.75)  # данные приглушены — 75% видимости
-        self._path_rect = None
-        y = box.top() + pad
-        for (k, _), v in zip(self.info, vals):
-            p.setFont(f)
-            p.setPen(QtGui.QColor(ui.DIM))
-            p.drawText(QtCore.QRectF(box.left() + pad, y, lw, lh), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, k)
-            vr = QtCore.QRectF(box.left() + pad + lw + gap, y, vw, lh)
-            if k == "Name":
-                p.setFont(fb)
-                p.setPen(QtGui.QColor(ui.TEXT))
-            elif k == "Path":
-                p.setPen(QtGui.QColor(ui.ACCENT))
-                self._path_rect = QtCore.QRectF(vr.left(), y, fm.horizontalAdvance(v), lh)
-            else:
-                p.setPen(QtGui.QColor(ui.TEXT))
-            p.drawText(vr, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, v)
-            y += lh
-        p.setOpacity(1.0)
+        _, self._path_rect = paint_info_box(p, self.info, QtCore.QPointF(12, 12), self.font(), self.width() - 24)
 
     def _on_path(self, pos):
         return bool(self.info and self._path_rect and self._path_rect.contains(pos))
@@ -1272,9 +1721,52 @@ class Viewer(QOpenGLWidget):
         base = self._scale() * self.devicePixelRatioF() if self.fit else self.zoom
         self.set_zoom(base * f, e.position())
 
+    def tabletEvent(self, e):
+        """Перо планшета: запоминаем нажим, а само рисование идёт через мышиные события,
+        которые Qt делает из пера (событие не принимаем)."""
+        t = e.type()
+        if t == QtCore.QEvent.TabletPress:
+            self._pen_p = e.pressure()
+        elif t == QtCore.QEvent.TabletMove and self._pen_p is not None:
+            self._pen_p = 0.5 * self._pen_p + 0.5 * e.pressure()  # без дрожи толщины
+        elif t == QtCore.QEvent.TabletRelease:
+            self._pen_p = None
+        e.ignore()
+
+    def _pen_pt(self, pos, start=False):
+        q = self._norm(pos)
+        if self.tool != "pen":
+            return q
+        p = self._pen_p
+        if p is None:  # Qt нажима не дал (Windows Ink выключен) — спросить Wintab
+            wt = wintab(self)
+            if start:
+                self._wt_p = wt.pressure() if wt else None
+            elif wt:
+                v = wt.pressure()
+                if v is not None:
+                    self._wt_p = v if self._wt_p is None else 0.5 * self._wt_p + 0.5 * v
+            p = self._wt_p
+        if p is not None:
+            q.append(round(max(0.0, min(1.0, p)), 3))
+        return q
+
     def mousePressEvent(self, e):
         clear_focus()
         self.bubble.close_edit()  # клик мимо редактора — сохранить и закрыть
+        # навигация пером (и мышью) при любом инструменте: Shift+тянуть — двигать, Ctrl+тянуть — масштаб
+        mods = e.modifiers()
+        if (e.button() == QtCore.Qt.LeftButton and self.img is not None
+                and mods & (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier)
+                and not self._wipe_hit(e.position())):
+            if mods & QtCore.Qt.ControlModifier:
+                z0 = self._scale() * self.devicePixelRatioF() if self.fit else self.zoom
+                self._nav = ("zoom", e.position(), z0)
+                self.setCursor(QtCore.Qt.SizeHorCursor)
+            else:
+                self._nav = ("pan", e.position(), None)
+                self.setCursor(QtCore.Qt.ClosedHandCursor)
+            return
         if e.button() == QtCore.Qt.LeftButton and self._on_path(e.position()) and self.info_path:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self.info_path))
             return
@@ -1306,8 +1798,8 @@ class Viewer(QOpenGLWidget):
             return
         if (self.tool and self.img is not None and e.button() == QtCore.Qt.LeftButton
                 and not e.modifiers() & QtCore.Qt.AltModifier):
-            q = self._norm(e.position())
-            pts = [q] if self.tool == "pen" else [q, list(q)]
+            q = self._pen_pt(e.position(), start=True)
+            pts = [q] if self.tool == "pen" else [q[:2], q[:2]]
             self.live = ann.Stroke(self.tool, self.color, self.stroke_w, pts, alpha=self.alpha)
             self._last_wp = e.position()
             self.update()
@@ -1315,6 +1807,18 @@ class Viewer(QOpenGLWidget):
         self._drag = e.position()
 
     def mouseMoveEvent(self, e):
+        if self._nav is not None:
+            mode, p0, z0 = self._nav
+            if mode == "zoom":  # вправо/вверх — крупнее, точка нажатия стоит на месте
+                d = (e.position().x() - p0.x()) - (e.position().y() - p0.y())
+                self.set_zoom(z0 * 1.006 ** d, p0)
+            else:
+                if self.fit:
+                    self.set_zoom(self._scale() * self.devicePixelRatioF())
+                self.pan += e.position() - p0
+                self._nav = (mode, e.position(), None)
+                self.update()
+            return
         if self._wipe_drag:
             self._drag_wipe(e.position(), bool(e.modifiers() & QtCore.Qt.ShiftModifier))
             return
@@ -1343,6 +1847,8 @@ class Viewer(QOpenGLWidget):
                 self.setToolTip("")
             return
         if not self.live and self._drag is None:
+            if self.tool == "pen" and (wt := wintab(self)):
+                wt.pressure()  # перо над кадром: старые пакеты из очереди вон, к нажатию она свежая
             wh = self._wipe_hit(e.position()) is not None
             if wh != self._wipe_hover:
                 self._wipe_hover = wh
@@ -1373,7 +1879,11 @@ class Viewer(QOpenGLWidget):
             if self.live.tool == "pen":
                 d = e.position() - self._last_wp
                 if abs(d.x()) + abs(d.y()) >= 2:
-                    self.live.pts.append(self._norm(e.position()))
+                    q = self._pen_pt(e.position())
+                    if len(q) > 2 and len(self.live.pts[0]) == 2:  # нажим пришёл не с первой точки
+                        for a in self.live.pts:
+                            a.append(q[2])
+                    self.live.pts.append(q)
                     self._last_wp = e.position()
             else:
                 self.live.pts[-1] = self._norm(e.position())
@@ -1387,6 +1897,10 @@ class Viewer(QOpenGLWidget):
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if self._nav is not None:
+            self._nav = None
+            self.setCursor(QtCore.Qt.CrossCursor if self.tool else QtCore.Qt.ArrowCursor)
+            return
         if self._wipe_drag:
             self._wipe_drag = None
             self.update()
@@ -1436,6 +1950,7 @@ class Timeline(QtWidgets.QWidget):
     layer_opacity = QtCore.Signal(int, float)  # тянут прозрачность на полоске — вживую
     layer_offset = QtCore.Signal(int, int)  # тянут полоску влево/вправо — новый сдвиг слоя в кадрах, вживую
     layer_popup = QtCore.Signal(int, str, QtCore.QPoint)  # иконка на полоске: 'info' | 'adjust'
+    layer_chan = QtCore.Signal(int, QtCore.QPoint)  # клик по каналу на полоске — каналы и слои EXR
     io_changed = QtCore.Signal(object, object)  # точки входа/выхода (индексы кадров или None)
     PAD = 14
     BASE = 46  # высота без дорожки клипов
@@ -1456,7 +1971,8 @@ class Timeline(QtWidgets.QWidget):
         self.drag_layer = None  # [полоска, y нажатия, y сейчас, нажали на ≡, x нажатия, x сейчас, ось 'v'|'h'|None, сдвиг до]
         self.hover_layer = None  # (полоска, 'grip' | 'close' | 'eye' | 'mode' | 'op') под мышью
         self.base = ""  # имя A
-        self.base_look = (True, "Normal", 1.0, 0.0)  # A: видим, режим, прозрачность, EV
+        self.base_look = (True, "Normal", 1.0, 0.0, "RGB")  # A: видим, режим, прозрачность, EV, канал
+        self.info_open = None  # полоска, у которой сейчас открыта плашка ⓘ (иконка горит)
         self.drag_clip = None
         self.drag_x0 = self.drag_x = 0.0
         self.io = None  # (вход, выход) — кусок, который смотрим; None — весь клип
@@ -1471,7 +1987,7 @@ class Timeline(QtWidgets.QWidget):
         self.drag_clip = None
         self._fit_height()
 
-    def set_layers(self, layers, base="", base_look=(True, "Normal", 1.0, 0.0)):
+    def set_layers(self, layers, base="", base_look=(True, "Normal", 1.0, 0.0, "RGB")):
         self.layers = list(layers)
         self.base = base
         self.base_look = base_look
@@ -1491,11 +2007,11 @@ class Timeline(QtWidgets.QWidget):
         return len(self.layers) + (0 if self.clips else 1)
 
     def _row(self, k):
-        """(длина, имя, буква, видим, режим, прозрачность, шторка, сдвиг, EV) полоски k; последняя — A."""
+        """(длина, имя, буква, видим, режим, прозрачность, шторка, сдвиг, EV, канал) полоски k; последняя — A."""
         if k < len(self.layers):
             return self.layers[k]
-        vis, mode, op, ev = self.base_look
-        return self.n, self.base, "A", vis, mode, op, False, 0, ev
+        vis, mode, op, ev, chan = self.base_look
+        return self.n, self.base, "A", vis, mode, op, False, 0, ev, chan
 
     def _span(self, k):
         """Кадры A, где лежит полоска k: (первый, последний) с учётом сдвига, внутри таймлайна."""
@@ -1583,7 +2099,7 @@ class Timeline(QtWidgets.QWidget):
         """× — справа на полоске: убрать слой."""
         return QtCore.QRectF(r.right() - 18, r.top(), 18, r.height())
 
-    OP_W, MODE_W = 84, 72  # прозрачность (ползунок + %), режим (имя + ▾)
+    OP_W, MODE_W, CHAN_W = 84, 72, 66  # прозрачность (ползунок + %), режим (имя + ▾), канал / слой EXR (имя + ▾)
 
     def _parts(self, k, r):
         """Где что на полоске слоя: ≡ по центру; справа налево × · глаз · прозрачность · режим · split.
@@ -1601,6 +2117,9 @@ class Timeline(QtWidgets.QWidget):
             if x - self.MODE_W >= room:
                 P["mode"] = QtCore.QRectF(x - self.MODE_W, r.top(), self.MODE_W, r.height())
                 x -= self.MODE_W + 6
+                if x - self.CHAN_W >= room:  # канал / слой EXR этого клипа
+                    P["chan"] = QtCore.QRectF(x - self.CHAN_W, r.top(), self.CHAN_W, r.height())
+                    x -= self.CHAN_W + 6
                 for key in ("adjust", "split", "info"):  # иконки: настройки вида, шторка-сравнение, метаданные
                     if key == "split" and k >= len(self.layers):
                         continue  # у A шторки нет — она у слоёв
@@ -1616,7 +2135,7 @@ class Timeline(QtWidgets.QWidget):
         return QtCore.QRectF(op_rect.left() + 4, op_rect.center().y() - 1.5, op_rect.width() - 38, 3)
 
     def _layer_bar(self, p, k, r, fm, ghost=False):
-        n, name, tag, vis, mode, op, split, off, ev = self._row(k)
+        n, name, tag, vis, mode, op, split, off, ev, chan = self._row(k)
         P = self._parts(k, r)
         text = name + (f"  ·  {off:+d} fr" if off else "") + (f"  ·  {ev:+.1f} EV" if ev else "")
         lefts = [v.left() for key, v in P.items() if key != "grip" and v.left() > r.center().x() - 11]
@@ -1629,7 +2148,8 @@ class Timeline(QtWidgets.QWidget):
         for key, name_, lit in (("info", "info", False), ("split", "split", split), ("adjust", "adjust", bool(ev))):
             if key in P:  # иконка: жёлтая — включено (шторка) или под мышью; светлая — изменено (яркость)
                 ir = P[key]
-                c_ = ui.ACCENT if hot == (k, key) or (lit and key == "split" and vis) else (
+                c_ = ui.ACCENT if hot == (k, key) or (lit and key == "split" and vis) or (
+                    key == "info" and self.info_open == k) else (
                     ui.TEXT if lit and vis else ui.MUTED if not vis else ui.DIM)
                 ui.icon(name_, c_).paint(p, QtCore.QRect(int(ir.center().x() - 6.5), int(ir.center().y() - 6.5), 13, 13))
         if "mode" in P:  # режим наложения: «Add ▾»
@@ -1638,6 +2158,12 @@ class Timeline(QtWidgets.QWidget):
             p.setPen(C(ui.ACCENT) if on else (col if mode != "Normal" else dim))
             tr = mr.adjusted(0, 0, -11, 0)
             p.drawText(tr, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight, fm.elidedText(mode, QtCore.Qt.ElideRight, tr.width()))
+        if "chan" in P:  # канал или слой EXR: «diffuse ▾»
+            cr = P["chan"]
+            on = hot == (k, "chan")
+            p.setPen(C(ui.ACCENT) if on else (col if chan != "RGB" else dim))
+            tr = cr.adjusted(0, 0, -11, 0)
+            p.drawText(tr, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight, fm.elidedText(chan, QtCore.Qt.ElideMiddle, tr.width()))
         if "op" in P:  # прозрачность: тонкий ползунок + «60%»
             orr = P["op"]
             tr = self._op_track(orr)
@@ -1657,9 +2183,11 @@ class Timeline(QtWidgets.QWidget):
                        QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight, f"{round(op * 100)}%")
         p.save()
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        if "mode" in P:  # ▾ у режима
-            c = QtCore.QPointF(P["mode"].right() - 4, P["mode"].center().y())
-            p.setPen(QtGui.QPen(C(ui.ACCENT) if hot == (k, "mode") else dim, 1.3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        for key in ("mode", "chan"):  # ▾ у режима и канала
+            if key not in P:
+                continue
+            c = QtCore.QPointF(P[key].right() - 4, P[key].center().y())
+            p.setPen(QtGui.QPen(C(ui.ACCENT) if hot == (k, key) else dim, 1.3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
             p.drawLine(QtCore.QPointF(c.x() - 3, c.y() - 1.5), QtCore.QPointF(c.x(), c.y() + 1.5))
             p.drawLine(QtCore.QPointF(c.x(), c.y() + 1.5), QtCore.QPointF(c.x() + 3, c.y() - 1.5))
         if "grip" in P:
@@ -1691,7 +2219,7 @@ class Timeline(QtWidgets.QWidget):
         if not (r.left() <= pos.x() <= r.right()):
             return None
         P = self._parts(k, r)
-        for key in ("close", "eye", "op", "mode", "info", "split", "adjust"):
+        for key in ("close", "eye", "op", "mode", "chan", "info", "split", "adjust"):
             if key in P and P[key].adjusted(-1, 0, 1, 0).contains(pos):
                 return k, key
         if "grip" in P and P["grip"].adjusted(-3, 0, 3, 0).contains(pos):
@@ -1962,11 +2490,12 @@ class Timeline(QtWidgets.QWidget):
                     return
                 if what in ("info", "adjust"):
                     r = self._parts(k, self._layer_rect(k))[what]
-                    self.layer_popup.emit(k, what, self.mapToGlobal(QtCore.QPoint(int(r.left()), int(r.bottom()) + 4)))
+                    self.layer_popup.emit(k, what, self.mapToGlobal(QtCore.QPoint(int(r.left()), int(r.top()) - 4)))
                     return
-                if what == "mode":
-                    r = self._parts(k, self._layer_rect(k))["mode"]
-                    self.layer_mode.emit(k, self.mapToGlobal(QtCore.QPoint(int(r.left()), int(r.bottom()) + 4)))
+                if what in ("mode", "chan"):
+                    r = self._parts(k, self._layer_rect(k))[what]
+                    (self.layer_mode if what == "mode" else self.layer_chan).emit(
+                        k, self.mapToGlobal(QtCore.QPoint(int(r.left()), int(r.top()) - 4)))
                     return
                 if what == "op":
                     self.drag_op = k
@@ -2035,10 +2564,11 @@ class Timeline(QtWidgets.QWidget):
             self.update()
         if (k := self._in_layer(e.position())) is not None:
             what = part[1] if part else None
-            self.setCursor(QtCore.Qt.PointingHandCursor if what in ("grip", "close", "eye", "mode", "info", "split", "adjust")
+            self.setCursor(QtCore.Qt.PointingHandCursor if what in ("grip", "close", "eye", "mode", "chan", "info", "split",
+                                                                    "adjust")
                            else QtCore.Qt.SizeHorCursor if what == "op"
                            else QtCore.Qt.OpenHandCursor if what else QtCore.Qt.ArrowCursor)
-            n, name, tag, vis, mode, op, split, off, ev = self._row(k)
+            n, name, tag, vis, mode, op, split, off, ev, chan = self._row(k)
             info = f"{tag}  {name}  ·  {n} frames{'' if vis else '  ·  hidden'}" + (f"  ·  shifted {off:+d} fr" if off else "")
             if k >= len(self.layers):
                 info += "  ·  base clip — drag it up into the stack to make another clip the base"
@@ -2046,6 +2576,7 @@ class Timeline(QtWidgets.QWidget):
                              "close": "Remove layer" if k < len(self.layers) else "Remove A — the layer below takes its place",
                              "eye": "Hide layer" if vis else "Show layer",
                              "mode": f"Blend mode: {mode}", "op": f"Opacity {round(op * 100)}% — drag to change",
+                             "chan": f"Channel: {chan} — channels and EXR layers (AOV) of this clip",
                              "info": "Metadata", "split": "Split compare — " + ("on" if split else "off"),
                              "adjust": f"Brightness {ev:+.1f} EV · opacity · blend mode"
                              }.get(what, f"{info}\n" + ("Drag up / down to reorder · right-click for settings"
@@ -2092,7 +2623,7 @@ class Timeline(QtWidgets.QWidget):
                     self.layer_moved.emit(k, t)
             elif axis is None and grip:  # клик по ≡ — меню под ним
                 r = self._grip_rect(self._layer_rect(k))
-                self.layer_menu.emit(k, self.mapToGlobal(QtCore.QPoint(int(r.left()), int(r.bottom()) + 4)))
+                self.layer_menu.emit(k, self.mapToGlobal(QtCore.QPoint(int(r.left()), int(r.top()) - 4)))
             self.update()
             return
         if self.drag_clip is None:
@@ -2327,6 +2858,7 @@ class NoteCard(QtWidgets.QFrame):
     двойной клик — редактировать текст прямо в карточке (обводится рамкой)."""
     clicked = QtCore.Signal(object)
     edited = QtCore.Signal(object)
+    entered = QtCore.Signal(object)  # закончили Enter-ом
 
     def __init__(self, note, num, header):
         super().__init__()
@@ -2364,7 +2896,7 @@ class NoteCard(QtWidgets.QFrame):
     def _update_body(self):
         t = self.note.text.strip()
         if not t:
-            self.body.setText("<span style='color:#777'>" + ("drawing — double-click to add a note" if self.note.strokes else "double-click to write") + "</span>")
+            self.body.setText("<span style='color:#777'>" + (f"{SKETCH_TEXT} — double-click to add a note" if self.note.strokes else "double-click to write") + "</span>")
         else:
             short = t if len(t) <= 140 else t[:140].rstrip() + "…"
             self.body.setText(short.replace("&", "&amp;").replace("<", "&lt;").replace("\n", "<br>"))
@@ -2420,6 +2952,8 @@ class NoteCard(QtWidgets.QFrame):
                 # Enter или Esc — закончить; Shift+Enter — новая строка
                 if e.key() == QtCore.Qt.Key_Escape or (enter and not e.modifiers() & QtCore.Qt.ShiftModifier):
                     self.edit.clearFocus()
+                    if enter:
+                        self.entered.emit(self.note)
                     return True
             if e.type() == QtCore.QEvent.FocusOut:
                 self.finish_edit()
@@ -2494,8 +3028,9 @@ class Fold(QtWidgets.QWidget):
                 tri = [c + QtCore.QPointF(-3, -5), c + QtCore.QPointF(-3, 5), c + QtCore.QPointF(4, 0)]
         p.drawPolygon(QtGui.QPolygonF(tri))
         f = QtGui.QFont(self.font())
-        f.setPixelSize(11)
+        f.setPixelSize(12)
         p.setFont(f)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing)
         fm = QtGui.QFontMetricsF(f)
         tw = fm.horizontalAdvance(self.title)
         p.setPen(col)
@@ -2627,11 +3162,13 @@ class DropOverlay(QtWidgets.QWidget):
 class Layer:
     """Клип поверх кадра A: свой загрузчик кадров + как он ложится (прозрачность, режим, видимость, шторка)."""
 
-    def __init__(self, src, loader, opacity=1.0, mode="Normal", visible=True, split=False, offset=0, ev=0.0):
+    def __init__(self, src, loader, opacity=1.0, mode="Normal", visible=True, split=False, offset=0, ev=0.0, aov=None, channel="RGB"):
         self.src, self.loader = src, loader
         self.opacity, self.mode, self.visible, self.split = opacity, mode, visible, split
         self.offset = offset  # с какого кадра A слой начинается (сдвиг по таймлайну, может быть < 0)
         self.ev = ev  # яркость слоя в стопах — поверх общей экспозиции
+        self.aov = aov  # свой слой EXR (AOV) этого клипа; None — основной. У A — из списка каналов
+        self.channel = channel  # свой канал (RGB, R, G, B, A, Luma) — когда AOV не выбран
         self.img = None
         self.tag = "B"
 
@@ -2673,6 +3210,8 @@ class Player(QtWidgets.QMainWindow):
         self.viewer.image_edited.connect(lambda n: (self.note_edited(n), self.viewer.update()))
         self.viewer.bubble.changed.connect(self.bubble_changed)
         self.viewer.bubble.done.connect(lambda n: self.notes_changed())
+        self.viewer.bubble.entered.connect(self.note_committed)
+        self.draw_note = None  # комментарий, в который идут штрихи («+» или эскиз); Enter его закрывает
         self.viewer.badge_clicked.connect(self.badge_clicked)
         self.timeline = Timeline()
         self.timeline.scrubbed.connect(self.scrub)
@@ -2686,6 +3225,7 @@ class Player(QtWidgets.QMainWindow):
                                             if self._layer_at(k).opacity != v else None)
         self.timeline.layer_offset.connect(lambda k, v: self.set_layer(self._layer_at(k), offset=v)
                                            if self._layer_at(k) is not self.base_look else None)
+        self.timeline.layer_chan.connect(lambda k, pos: self.chan_menu(self._layer_at(k), pos))
         self.timeline.layer_popup.connect(lambda k, what, pos: (self.info_popup if what == "info" else self.look_menu)(
             self._layer_at(k), pos))
         self.timeline.io_changed.connect(self.set_io)
@@ -2735,10 +3275,15 @@ class Player(QtWidgets.QMainWindow):
         self.aov = QtWidgets.QComboBox()  # слой EXR (AOV): виден, только если в файле их несколько
         self.aov.addItem(BASE_LAYER, None)
         self.aov.setToolTip("EXR layer (AOV) — beauty, diffuse, specular, Z …")
-        self.aov.setVisible(False)
+        self.aov.setVisible(False)  # больше не показывается: слои EXR — в списке каналов, под чертой
         self.view = QtWidgets.QComboBox()
         self.view.addItems(["sRGB", "Linear"])
-        self.view.setToolTip("Display transform for EXR/HDR")
+        if ocio_views():  # под чертой — OCIO: ACES 1 / ACES 2 / без тонмаппинга (+ виды конфига $OCIO)
+            self.view.insertSeparator(self.view.count())
+            self.view.addItems(list(ocio_views()))
+        self.view.setToolTip("Display transform for EXR/HDR · below the line — OCIO ACES 1.0: "
+                             "colour space of the EXR → monitor (the file's own space is in Info)")
+        self.view.setCurrentText(self.settings.value("view", "sRGB"))
         self.chk_half = QtWidgets.QCheckBox("½ res")
         self.lbl_info = QtWidgets.QLabel()
         self.lbl_info.setObjectName("dimLabel")
@@ -2768,7 +3313,7 @@ class Player(QtWidgets.QMainWindow):
         ui.fit_combo(self.channel)
         ui.fit_combo(self.speed)
         ui.fit_combo(self.view)
-        self.matte = QtWidgets.QComboBox()
+        self.matte =QtWidgets.QComboBox()
         self.matte.addItems(list(MATTES))
         ui.small(self.matte)
         self.matte.setToolTip("Matte — aspect ratio mask (M to cycle)")
@@ -2790,7 +3335,7 @@ class Player(QtWidgets.QMainWindow):
         self.exposure.valueChanged.connect(self.params_changed)
         self.channel.currentIndexChanged.connect(self.params_changed)
         self.aov.currentIndexChanged.connect(self.params_changed)
-        self.view.currentIndexChanged.connect(self.params_changed)
+        self.view.currentIndexChanged.connect(self.view_changed)
         self.chk_half.toggled.connect(self.params_changed)
 
         self.btn_info = ui.icon_button("info", "File info (Shift+I)", checkable=True)
@@ -3186,14 +3731,35 @@ class Player(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, lambda: act(paths))
 
     # ---- params
+    def _chan_aov(self):
+        """Один список «Канал»: основные каналы (RGB, R, G, B, A, Luma), под чертой — слои EXR (AOV).
+        Выбран слой → показываем его RGB; выбран канал → основной слой."""
+        layer = self.channel.currentData()
+        return ("RGB", layer) if layer else (self.channel.currentText(), None)
+
     def current_params(self):
-        return (self.exposure.value(), self.channel.currentText(), self.view.currentText(), self.chk_half.isChecked(),
-                self.aov.currentData())
+        ch, aov = self._chan_aov()
+        return (self.exposure.value(), ch, self.view.currentText(), self.chk_half.isChecked(), aov)
 
     def _params(self, L=None):
         """Параметры декодирования клипа: общие + своя яркость слоя (или A)."""
         e, ch, view, half, aov = self.current_params()
+        if L is not None and L is not self.base_look:  # у слоя стопки — свой канал / AOV, у A — из списка внизу
+            aov = L.aov
+            ch = "RGB" if aov else L.channel
         return (e + (L.ev if L is not None else 0.0), ch, view, half, aov)
+
+    def _set_base_chan(self, channel="RGB", layer=None):
+        """Канал или слой EXR основного клипа A — в списке внизу (после смены A на другой клип или с полоски)."""
+        i = self.channel.findData(layer) if layer else self.channel.findText(channel)
+        self.channel.setCurrentIndex(max(0, i))
+
+    @staticmethod
+    def _clip_aovs(src):
+        """Слои EXR клипа (без основного)."""
+        if isinstance(src, SequenceSource):
+            return [nm for nm in exr_layers(src.items[0][0]) if nm != BASE_LAYER]
+        return []
 
     def params_changed(self, *_):
         if self.loader:
@@ -3202,6 +3768,15 @@ class Player(QtWidgets.QMainWindow):
         for L in self.layers:
             L.loader.set_params(self._params(L))
             L.loader.set_playhead(L.index(self.frame) or 0)
+        if self.layers:  # канал A виден и на его полоске
+            self._layers_timeline()
+
+    def view_changed(self, *_):
+        """Показ (sRGB / Linear / OCIO) — запоминаем."""
+        self.settings.setValue("view", self.view.currentText())
+        if hasattr(self, "bar"):
+            self.bar.invalidate()
+        self.params_changed()
 
     def matte_changed(self, *_):
         self.viewer.matte = MATTES.get(self.matte.currentText())
@@ -3231,28 +3806,72 @@ class Player(QtWidgets.QMainWindow):
                 for nm in exr_layers(c.items[0][0]):
                     if nm not in names:
                         names.append(nm)
-        cur = self.aov.currentData()
-        self.aov.blockSignals(True)
-        self.aov.clear()
-        self.aov.addItem(BASE_LAYER, None)
-        for nm in names:
-            if nm != BASE_LAYER:
-                self.aov.addItem(nm, nm)
-        i = self.aov.findData(cur) if cur else 0
-        self.aov.setCurrentIndex(max(0, i))
-        self.aov.blockSignals(False)
-        ui.fit_combo(self.aov)
-        show = self.aov.count() > 1
-        if show != self.aov.isVisible():
-            self.aov.setVisible(show)
+        extra = [nm for nm in names if nm != BASE_LAYER]
+        old = [self.channel.itemData(i) for i in range(self.channel.count()) if self.channel.itemData(i)]
+        if extra == old:
+            return
+        cur_ch, cur_layer = self._chan_aov()
+        cb = self.channel
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItems(list(CHANNELS))
+        if extra:  # слои EXR — в том же списке, под чертой
+            cb.insertSeparator(cb.count())
+            for nm in extra:
+                cb.addItem(nm, nm)
+        i = cb.findData(cur_layer) if cur_layer else cb.findText(cur_ch)
+        cb.setCurrentIndex(max(0, i))
+        cb.blockSignals(False)
+        cb.setToolTip("Channel · EXR layers (AOV) below the line" if extra else "")
+        ui.fit_combo(cb)
         self.bar.invalidate()
+        if cur_layer and i < 0:  # выбранного слоя в новом клипе нет — обратно к основному
+            self.params_changed()
 
     def step_aov(self, d):
-        if self.aov.count() > 1:
-            self.aov.setCurrentIndex((self.aov.currentIndex() + d) % self.aov.count())
+        """Следующий / предыдущий слой EXR (с основным — RGB)."""
+        idx = [self.channel.findText("RGB")] + [i for i in range(self.channel.count()) if self.channel.itemData(i)]
+        if len(idx) > 1:
+            k = idx.index(self.channel.currentIndex()) if self.channel.currentIndex() in idx else 0
+            self.channel.setCurrentIndex(idx[(k + d) % len(idx)])
 
     def toggle_info(self, on):
         self.settings.setValue("show_info", "true" if on else "false")
+        self.update_info()
+        self.viewer.update()
+
+    @staticmethod
+    def _info_of(clip):
+        try:
+            return clip.info()
+        except Exception as e:
+            return {"name": clip.name, "path": "", "format": f"? ({e})", "w": 0, "h": 0,
+                    "bits": "?", "range": "?", "size": "?"}
+
+    def _clip_info(self, clip):
+        """Метаданные клипа. У секвенции (по сети это секунды: первый кадр целиком + размеры всех файлов)
+        считаем в фоне, а пока показываем то, что известно сразу."""
+        d = self.info_cache.get(id(clip))
+        if d is not None:
+            return d
+        if not isinstance(clip, SequenceSource):
+            d = self.info_cache[id(clip)] = self._info_of(clip)
+            return d
+        nums = clip.numbers
+        d = {"name": clip.file_label, "path": os.path.dirname(clip.items[0][0]), "format": "…", "w": 0, "h": 0,
+             "bits": "…", "range": f"{nums[0]}–{nums[-1]}", "size": "…"}
+        cache = self.info_cache[id(clip)] = d
+        if not hasattr(self, "_info_bridge"):
+            self._info_bridge = Bridge()
+            self._info_bridge.ready.connect(self._info_done)
+
+        def job(store=self.info_cache, key=id(clip)):
+            store[key] = self._info_of(clip)
+            self._info_bridge.ready.emit(0)
+        threading.Thread(target=job, daemon=True).start()
+        return cache
+
+    def _info_done(self, _):
         self.update_info()
         self.viewer.update()
 
@@ -3265,14 +3884,7 @@ class Player(QtWidgets.QMainWindow):
         comp = isinstance(self.src, CompositeSource)
         k, j = self.src.locate(self.frame) if comp else (0, self.frame)
         clip = self.src.clips[k] if comp else self.src
-        d = self.info_cache.get(id(clip))
-        if d is None:
-            try:
-                d = clip.info()
-            except Exception as e:
-                d = {"name": clip.name, "path": "", "format": f"? ({e})", "w": 0, "h": 0,
-                     "bits": "?", "range": "?", "size": "?"}
-            self.info_cache[id(clip)] = d
+        d = self._clip_info(clip)
         n, fps = clip.n, self.fps.value()
         rows = []
         if comp:
@@ -3283,8 +3895,12 @@ class Player(QtWidgets.QMainWindow):
         if isinstance(clip, SequenceSource):
             rows.append(("File", clip.frame_file(j)))
         rows.append(("Format", d["format"]))
-        if self.aov.count() > 1:
-            rows.append(("Layer", f"{self.aov.currentText()}   ·   {self.aov.count()} layers in the file"))
+        cs = clip.color_space() if isinstance(clip, SequenceSource) else None
+        if cs:  # что записано в заголовке EXR — подсказка, какой пункт ACES выбрать
+            rows.append(("Colour", f"{cs}  (from the file header)"))
+        n_aov = sum(1 for i in range(self.channel.count()) if self.channel.itemData(i))
+        if n_aov:
+            rows.append(("Layer", f"{self._chan_aov()[1] or BASE_LAYER}   ·   {n_aov + 1} layers in the file"))
         if d["h"]:
             rows.append(("Resolution", f"{d['w']} × {d['h']}   ({d['w'] / d['h']:.2f}:1)"))
         rows += [("Bit depth", d["bits"]),
@@ -3439,8 +4055,8 @@ class Player(QtWidgets.QMainWindow):
             return
         self.stop()
         for src in srcs:
-            loader = Loader(src, self.budget // 4, self._params(), alpha=True)
-            L = Layer(src, loader)
+            L = Layer(src, None)
+            L.loader = loader = Loader(src, self.budget // 4, self._params(L), alpha=True)
             loader.bridge.ready.connect(lambda j, L=L: self.on_layer_ready(L, j))
             self.layers.append(L)
         self._layers_changed()
@@ -3473,9 +4089,10 @@ class Player(QtWidgets.QMainWindow):
 
     def _layers_timeline(self):
         B = self.base_look
-        self.timeline.set_layers([(L.src.n, L.name, L.tag, L.visible, L.mode, L.opacity, L.split, L.offset, L.ev)
-                                  for L in reversed(self.layers)], self.src.file_label if self.src else "",
-                                 (B.visible, B.mode, B.opacity, B.ev))
+        self.timeline.set_layers([(L.src.n, L.name, L.tag, L.visible, L.mode, L.opacity, L.split, L.offset, L.ev,
+                                   self._chan_label(L)) for L in reversed(self.layers)],
+                                 self.src.file_label if self.src else "",
+                                 (B.visible, B.mode, B.opacity, B.ev, self._chan_label(B)))
 
     def _layer_at(self, k):
         """Полоска k на таймлайне (сверху вниз) → слой; нижняя полоска — вид A."""
@@ -3493,14 +4110,15 @@ class Player(QtWidgets.QMainWindow):
             self.statusBar().showMessage("The base can be swapped when a single clip is playing, not an edit", 3500)
             return
         L, a, frame, B = order[-1], self.src, self.frame, self.base_look
-        loader = Loader(a, self.budget // 4, self._params(B), alpha=True)
-        new = Layer(a, loader, B.opacity, B.mode, B.visible, ev=B.ev)  # каждый клип уносит свой вид
+        new = Layer(a, None, B.opacity, B.mode, B.visible, ev=B.ev, aov=self._chan_aov()[1], channel=self._chan_aov()[0])  # каждый клип уносит свой вид
+        new.loader = loader = Loader(a, self.budget // 4, self._params(new), alpha=True)
         B.opacity, B.mode, B.visible, B.ev = L.opacity, L.mode, L.visible, L.ev
         loader.bridge.ready.connect(lambda j, L=new: self.on_layer_ready(L, j))
         order[order.index(None)] = new
         self.layers = list(reversed(order[:-1]))
         L.loader.close()
         self.set_source(L.src, frame=min(frame, L.src.n - 1), fresh=False)
+        self._set_base_chan(L.channel, L.aov)
         self._layers_changed()
         self.show_frame(self.frame)
 
@@ -3514,7 +4132,7 @@ class Player(QtWidgets.QMainWindow):
             b.setChecked(name == L.mode)
             grp.addAction(b)
             b.triggered.connect(lambda _=False, name=name: self.set_layer(L, mode=name))
-        m.exec(pos)
+        popup_above(m, pos)
 
     def layer_menu(self, L, pos):
         """Все настройки слоя: видимость, режим наложения, прозрачность, шторка, порядок, A ⇄ слой, убрать."""
@@ -3538,6 +4156,19 @@ class Player(QtWidgets.QMainWindow):
             b.setChecked(name == L.mode)
             grp.addAction(b)
             b.triggered.connect(lambda _=False, name=name: self.set_layer(L, mode=name))
+        aovs = self._clip_aovs(self.src if base else L.src)
+        if aovs:  # слой EXR (AOV) этого клипа — у каждого свой
+            cur = self._chan_aov()[1] if base else L.aov
+            sub = m.addMenu(f"EXR layer:  {cur or BASE_LAYER}")
+            g2 = QtGui.QActionGroup(sub)
+            for nm in [None] + aovs:
+                b = sub.addAction(nm or BASE_LAYER)
+                b.setCheckable(True)
+                b.setChecked(nm == cur)
+                g2.addAction(b)
+                if nm is None:
+                    sub.addSeparator()
+                b.triggered.connect(lambda _=False, nm=nm: self._set_base_chan("RGB", nm) if base else self.set_layer(L, aov=nm, channel="RGB"))
         self._look_rows(m, L)
         if not base:
             self._offset_row(m, L)
@@ -3546,7 +4177,7 @@ class Player(QtWidgets.QMainWindow):
             m.addAction("Move up — the layer above becomes A", lambda: self.layer_action(L, "up"))
             m.addSeparator()
             m.addAction("Remove A — the layer above takes its place", lambda: self.layer_action(L, "remove"))
-            m.exec(pos)
+            popup_above(m, pos)
             return
         a = m.addAction("Split — show it on one side of a wipe")
         a.setCheckable(True)
@@ -3559,7 +4190,7 @@ class Player(QtWidgets.QMainWindow):
         m.addAction("Reset split", self.viewer.reset_wipe).setEnabled(L.split)
         m.addSeparator()
         m.addAction("Remove layer", lambda: self.layer_action(L, "remove"))
-        m.exec(pos)
+        popup_above(m, pos)
 
     def _slider_row(self, m, label, lo, hi, value, fmt, on_change, step=1, page=10):
         """Строка «подпись — ползунок — значение» прямо в меню; меняет вживую."""
@@ -3651,7 +4282,7 @@ class Player(QtWidgets.QMainWindow):
         m.addSeparator()
         kw = dict(ev=0.0, opacity=1.0, mode="Normal") if base else dict(ev=0.0, opacity=1.0, mode="Normal", offset=0)
         m.addAction("Reset", lambda: self.set_layer(L, **kw))
-        m.exec(pos)
+        popup_above(m, pos)
 
     def info_popup(self, L, pos):
         """i на полоске: метаданные клипа слоя (или A)."""
@@ -3661,14 +4292,7 @@ class Player(QtWidgets.QMainWindow):
         clip = self.src if base else L.src
         if isinstance(clip, CompositeSource):
             clip = clip.clips[clip.locate(self.frame)[0]]
-        d = self.info_cache.get(id(clip))
-        if d is None:
-            try:
-                d = clip.info()
-            except Exception as e:
-                d = {"name": clip.name, "path": "", "format": f"? ({e})", "w": 0, "h": 0,
-                     "bits": "?", "range": "?", "size": "?"}
-            self.info_cache[id(clip)] = d
+        d = self._clip_info(clip)
         fps = self.fps.value()
         rows = [("Name", d["name"]), ("Path", d["path"]), ("Format", d["format"])]
         if d["h"]:
@@ -3677,38 +4301,65 @@ class Player(QtWidgets.QMainWindow):
                  ("Duration", f"{clip.n / fps:.2f} s   ·   {self.timecode(clip.n)} @ {fps:g} fps"), ("Size", d["size"])]
         look = f"{L.mode}   ·   {round(L.opacity * 100)}%   ·   {L.ev:+.1f} EV" + ("" if L.visible else "   ·   hidden")
         rows.append(("Look", look))
+        rows.append(("Channel", self._chan_label(L)))
+        n_aov = len(self._clip_aovs(clip))
+        if n_aov:
+            rows.append(("EXR layers", f"{n_aov + 1} in the file"))
         if not base:
             a = max(0, L.offset)
             rows.append(("Offset", f"{L.offset:+d} fr   ·   starts at frame {self.src.numbers[min(a, self.src.n - 1)]} of A"
                          if L.offset else "in sync with A"))
-        esc = lambda t: str(t).replace("&", "&amp;").replace("<", "&lt;")
-        html = "<table cellspacing=0 cellpadding=2>" + "".join(
-            f"<tr><td style='color:{ui.DIM};padding-right:12px'>{esc(k)}</td><td>{esc(v)}</td></tr>" for k, v in rows) + "</table>"
+        rows.insert(0, ("Layer", L.tag))
+        k = len(self.layers) if base else len(self.layers) - 1 - self.layers.index(L)  # полоска на таймлайне
+        if not hasattr(self, "_info_pop"):
+            self._info_pop = InfoPopup(self)
+            self._info_pop.closed.connect(lambda: (setattr(self.timeline, "info_open", None), self.timeline.update()))
+        self.timeline.info_open = k
+        self.timeline.update()
+        self._info_pop.show_rows(rows, d["path"], pos)
+
+    def _chan_label(self, L):
+        """Что показывает клип на полоске: канал (RGB, R, …, Luma) или слой EXR."""
+        if L is self.base_look:
+            return self.channel.currentText()
+        return L.aov or L.channel
+
+    def chan_menu(self, L, pos):
+        """Канал или слой EXR (AOV) клипа — по клику на «RGB ▾» прямо на полоске. У A — то же, что список внизу."""
+        base = L is self.base_look
+        if not base and L not in self.layers:
+            return
+        cur = self._chan_label(L)
         m = QtWidgets.QMenu(self)
-        m.addAction(f"{L.tag}   {clip.file_label}").setEnabled(False)
-        m.addSeparator()
-        lab = QtWidgets.QLabel(html)
-        lab.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        lab.setContentsMargins(16, 4, 16, 6)
-        lab.setMaximumWidth(620)
-        lab.setWordWrap(True)
-        wa = QtWidgets.QWidgetAction(m)
-        wa.setDefaultWidget(lab)
-        m.addAction(wa)
-        if d["path"]:
+        grp = QtGui.QActionGroup(m)
+
+        def add(text, ch, aov):
+            b = m.addAction(text)
+            b.setCheckable(True)
+            b.setChecked(text == cur)
+            grp.addAction(b)
+            b.triggered.connect(lambda _=False: self._set_base_chan(ch, aov) if base
+                                else self.set_layer(L, channel=ch, aov=aov))
+        for ch in CHANNELS:
+            add(ch, ch, None)
+        aovs = self._clip_aovs(self.src if base else L.src)
+        if aovs:
             m.addSeparator()
-            m.addAction("Show in Finder" if sys.platform == "darwin" else "Show in folder",
-                        lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d["path"])))
-        m.exec(pos)
+            for nm in aovs:
+                add(nm, "RGB", nm)
+        popup_above(m, pos)
 
     def set_layer(self, L, **kw):
         for key, v in kw.items():
             setattr(L, key, v)
-        if "ev" in kw:  # яркость — заново декодируем кадры этого клипа
+        redecode = "ev" in kw or "aov" in kw or "channel" in kw
+        if redecode:  # яркость / канал / слой EXR — заново декодируем кадры этого клипа
             loader = self.loader if L is self.base_look else L.loader
             if loader:
                 loader.set_params(self._params(L))
-        if "ev" in kw or "offset" in kw:
+                if L is not self.base_look:  # старая картинка висит, пока не готова новая
+                    loader.set_playhead(L.index(self.frame) or 0)
+        if redecode or "offset" in kw:
             self.show_frame(self.frame)
         self.layer_changed(L)
 
@@ -3756,6 +4407,7 @@ class Player(QtWidgets.QMainWindow):
         B.opacity, B.mode, B.visible, B.ev = L.opacity, L.mode, L.visible, L.ev
         L.loader.close()
         self.set_source(L.src, frame=min(frame, L.src.n - 1), fresh=False)
+        self._set_base_chan(L.channel, L.aov)
         self._layers_changed()
         self.show_frame(self.frame)
 
@@ -3764,12 +4416,13 @@ class Player(QtWidgets.QMainWindow):
         if isinstance(self.src, CompositeSource):
             self.statusBar().showMessage("Swap works when a single clip is playing, not an edit", 3500)
             return
-        a, k, frame = self.src, self.layers.index(L), self.frame
+        a, k, frame, (a_ch, a_aov) = self.src, self.layers.index(L), self.frame, self._chan_aov()
         L.loader.close()
         self.set_source(L.src, frame=min(frame, L.src.n - 1), fresh=False)
+        self._set_base_chan(L.channel, L.aov)
         B = self.base_look  # A уходит в стопку со своим видом, новый A — с видом слоя
-        loader = Loader(a, self.budget // 4, self._params(B), alpha=True)
-        new = Layer(a, loader, B.opacity, B.mode, B.visible, L.split, L.offset, B.ev)
+        new = Layer(a, None, B.opacity, B.mode, B.visible, L.split, L.offset, B.ev, aov=a_aov, channel=a_ch)
+        new.loader = loader = Loader(a, self.budget // 4, self._params(new), alpha=True)
         B.opacity, B.mode, B.visible, B.ev = L.opacity, L.mode, L.visible, L.ev
         self.loader.set_params(self._params(B))
         loader.bridge.ready.connect(lambda j, L=new: self.on_layer_ready(L, j))
@@ -3813,7 +4466,7 @@ class Player(QtWidgets.QMainWindow):
             lo, hi = self.play_range()
             if not lo <= self.frame < hi and hi > lo:
                 self.show_frame(lo)  # стоим вне куска или на его конце — играем с In
-            self.playing = True
+            self.playing = Loader.playing = True
             self.viewer.smooth = False
             self.btn_play.setIcon(ui.icon("pause", ui.ON_ACCENT))
             self.next_due = time.perf_counter()
@@ -3829,7 +4482,10 @@ class Player(QtWidgets.QMainWindow):
         self.speed.setCurrentIndex(max(0, min(self.speed.count() - 1, self.speed.currentIndex() + d)))
 
     def stop(self):
-        self.playing = False
+        self.playing = Loader.playing = False
+        for ld in [getattr(self, "loader", None)] + [getattr(L, "loader", None) for L in getattr(self, "layers", [])]:
+            if ld:
+                ld.set_playhead(ld.playhead)  # разбудить: на паузе кадр под плейхедом снова первый
         self.timer.stop()
         self.btn_play.setIcon(ui.icon("play", ui.ON_ACCENT))
         self.viewer.smooth = True
@@ -3970,6 +4626,11 @@ class Player(QtWidgets.QMainWindow):
         v.addWidget(title("AUTHOR"))
         self.author = QtWidgets.QLineEdit(self.settings.value("author", "") or os.environ.get("USER", ""))
         self.author.setFocusPolicy(QtCore.Qt.ClickFocus)
+        # только имя: длинный текст сюда попадает по ошибке вместо комментария и ставится автором всем
+        self.author.setPlaceholderText("Your name")
+        self.author.setMaxLength(40)
+        self.author.setToolTip("Your name — shown on every comment and in the PDF")
+        self.author.returnPressed.connect(self.author.clearFocus)
         self.author.textChanged.connect(lambda t: self.settings.setValue("author", t))
         v.addWidget(self.author)
 
@@ -4118,21 +4779,21 @@ class Player(QtWidgets.QMainWindow):
         if not self.src:
             return
         self.stop()
-        note = self.active if self.active and self.active.frame == self.frame else None
-        is_new = note is None
-        if is_new:
+        # рисуем в выбранный комментарий этого кадра (нажали «+» или кликнули по нему);
+        # иначе — в эскиз кадра: комментарий-рисунок с подписью, без окна ввода текста
+        # после Enter комментарий закрыт — новые штрихи начинают отдельный эскиз
+        note = self.draw_note
+        if note is None or note.frame != self.frame or note not in self.store.notes:
             note = self.make_note()
         note.strokes.append(stroke)
-        self.active = note
+        self.active = self.draw_note = note
         self.notes_changed()
-        if is_new:
-            self.write_note(note)  # сразу можно печатать комментарий
 
     def new_note(self):
         if not self.src:
             return
         self.stop()
-        self.active = self.make_note()
+        self.active = self.draw_note = self.make_note()
         self.notes_changed()
         self.write_note(self.active)
 
@@ -4192,6 +4853,11 @@ class Player(QtWidgets.QMainWindow):
             card.set_selected(True)
             QtCore.QTimer.singleShot(0, lambda: (card.start_edit(), self.cards_scroll.ensureWidgetVisible(card)))
 
+    def note_committed(self, note):
+        """Enter в комментарии: он готов, следующий рисунок на кадре — уже новый комментарий."""
+        if self.draw_note is note:
+            self.draw_note = None
+
     def note_edited(self, note):
         self.timeline.update()
         self.save_timer.start()
@@ -4217,6 +4883,7 @@ class Player(QtWidgets.QMainWindow):
                 c.set_selected(n is self.active)
                 c.clicked.connect(self.note_clicked)
                 c.edited.connect(self.note_edited)
+                c.entered.connect(self.note_committed)
                 self.cards_lay.insertWidget(self.cards_lay.count() - 1, c)
                 self.cards[n.id] = c
             marks = {}
@@ -4330,7 +4997,7 @@ class Player(QtWidgets.QMainWindow):
         try:
             ann.export_pdf(path, items, self.full_image, self.src.file_label, self.timecode, progress,
                            matte=self.viewer.matte, matte_alpha=self.viewer.matte_alpha,
-                           file_for=self.src.frame_file)
+                           file_for=self.src.frame_file, app_version=APP_VERSION)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "MOOOV_player", f"Export failed: {e}")
             return
@@ -4394,6 +5061,12 @@ def main():
     ap.add_argument("path", nargs="?")
     ap.add_argument("--cache-gb", type=float, default=6.0, help="RAM frame cache limit in GB (default 6)")
     args, _ = ap.parse_known_args()  # macOS может добавить свои служебные аргументы
+    if args.path:
+        args.path = os.path.abspath(args.path)
+    try:  # внешние программы (Acrobat, Проводник), открытые из плеера, наследуют рабочую папку —
+        os.chdir(os.path.expanduser("~"))  # не держать им папку плеера (обновление, переустановка)
+    except OSError:
+        pass
 
     fmt = QtGui.QSurfaceFormat()
     fmt.setSwapInterval(0)
@@ -4406,6 +5079,7 @@ def main():
     w = Player(args.cache_gb)
     app.window = w
     w.show()
+    QtCore.QTimer.singleShot(300, lambda: ui.warm_popups(w))  # списки открываются без задержки
     path = args.path or app.pending
     if path and os.path.exists(path):
         w.open(path)
