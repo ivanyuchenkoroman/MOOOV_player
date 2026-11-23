@@ -14,6 +14,12 @@ DefaultGroupName={#AppName}
 OutputDir=..\..\dist
 OutputBaseFilename={#AppName}-{#AppVersion}-win-setup
 SetupIconFile=..\MOOOV_player.ico
+; оформление в стиле плеера: тёмное окно, лого M▶ (картинки — make_installer_art.py, нужен Inno Setup 6.6+)
+WizardStyle=modern dark includetitlebar
+WizardBackColor=$121212
+WizardImageFile=wizard_large.png
+WizardSmallImageFile=wizard_small.png
+DisableWelcomePage=no
 UninstallDisplayIcon={app}\{#AppName}.exe
 Compression=lzma2
 SolidCompression=yes

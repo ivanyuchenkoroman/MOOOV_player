@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          choco upgrade innosetup -y --no-progress  # тёмное оформление установщика требует Inno Setup 6.6+
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Compress-Archive -Force dist\MOOOV_player "dist\MOOOV_player-$ver-win-portable.zip"
