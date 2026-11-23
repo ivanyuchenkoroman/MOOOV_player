@@ -4,7 +4,7 @@ A fast, quiet player for VFX review on Mac and Windows: videos and image sequenc
 
 Developed by Ivaniuchenko Roman for [mooov.team](https://mooov.team).
 
-![Review: drawing over an animation shot, comments panel on the right](docs/review.jpg)
+![MOOOV_player with the playlist, drawing and comments panels open](docs/player.png)
 
 ## What it does
 
@@ -20,8 +20,6 @@ Developed by Ivaniuchenko Roman for [mooov.team](https://mooov.team).
 - Info (Shift+I) reads the colour space from the EXR header, so you know which view to pick.
 - Exposure, R / G / B / A / Luma, half resolution, mattes.
 
-![EXR sequence in ACES2065-1 → sRGB with file info](docs/exr_aces.jpg)
-
 **Layers and compare**
 - Stack clips as layers with blend modes, opacity, time offset and a rotatable split wipe.
 - Edit mode: several clips one after another on one timeline. Playlists for a whole review session.
@@ -34,8 +32,6 @@ Developed by Ivaniuchenko Roman for [mooov.team](https://mooov.team).
 
 **PDF report**
 - One page per comment: number, frame, timecode, the text and the frame with the drawing; "Recorded with MOOOV_player <version> by <author>", date and file in the header.
-
-![PDF report page](docs/pdf_report.jpg)
 
 ## Install
 
