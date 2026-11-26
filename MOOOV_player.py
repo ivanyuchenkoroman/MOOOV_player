@@ -1949,6 +1949,8 @@ class Timeline(QtWidgets.QWidget):
     layer_mode = QtCore.Signal(int, QtCore.QPoint)  # клик по режиму на полоске — список режимов
     layer_opacity = QtCore.Signal(int, float)  # тянут прозрачность на полоске — вживую
     layer_offset = QtCore.Signal(int, int)  # тянут полоску влево/вправо — новый сдвиг слоя в кадрах, вживую
+    layer_trim = QtCore.Signal(int, int, int, int)  # тянут край полоски: (полоска, срез с начала, срез с конца, сдвиг)
+    layer_to_edit = QtCore.Signal(int, bool)  # полоску бросили в начало (True) или конец (False) монтажа
     layer_popup = QtCore.Signal(int, str, QtCore.QPoint)  # иконка на полоске: 'info' | 'adjust'
     layer_chan = QtCore.Signal(int, QtCore.QPoint)  # клик по каналу на полоске — каналы и слои EXR
     io_changed = QtCore.Signal(object, object)  # точки входа/выхода (индексы кадров или None)
@@ -1969,6 +1971,9 @@ class Timeline(QtWidgets.QWidget):
         self.layers = []  # слои поверх: [(длина, имя, буква, видим, режим, прозрачность, шторка, сдвиг, EV)] сверху вниз
         self.drag_op = None  # полоска, у которой тянем прозрачность
         self.drag_layer = None  # [полоска, y нажатия, y сейчас, нажали на ≡, x нажатия, x сейчас, ось 'v'|'h'|None, сдвиг до]
+        self.drag_trim = None  # (полоска, 'trim_l'|'trim_r', x нажатия, срез с начала, срез с конца, сдвиг, кадров в клипе)
+        self.snap_at = None  # граница (в кадрах), к которой сейчас прилипло — рисуем жёлтую черту
+        self.drop_hint = None  # перетаскивают файл над таймлайном: ('layer', кадр) | ('start', 0) | ('end', 0)
         self.hover_layer = None  # (полоска, 'grip' | 'close' | 'eye' | 'mode' | 'op') под мышью
         self.base = ""  # имя A
         self.base_look = (True, "Normal", 1.0, 0.0, "RGB")  # A: видим, режим, прозрачность, EV, канал
@@ -2007,11 +2012,12 @@ class Timeline(QtWidgets.QWidget):
         return len(self.layers) + (0 if self.clips else 1)
 
     def _row(self, k):
-        """(длина, имя, буква, видим, режим, прозрачность, шторка, сдвиг, EV, канал) полоски k; последняя — A."""
+        """(длина, имя, буква, видим, режим, прозрачность, шторка, сдвиг, EV, канал, срез с начала, срез с конца,
+        кадров в клипе) полоски k; последняя — A."""
         if k < len(self.layers):
             return self.layers[k]
         vis, mode, op, ev, chan = self.base_look
-        return self.n, self.base, "A", vis, mode, op, False, 0, ev, chan
+        return self.n, self.base, "A", vis, mode, op, False, 0, ev, chan, 0, 0, self.n
 
     def _span(self, k):
         """Кадры A, где лежит полоска k: (первый, последний) с учётом сдвига, внутри таймлайна."""
@@ -2069,7 +2075,7 @@ class Timeline(QtWidgets.QWidget):
                 continue
             self._layer_bar(p, k, r, fm)
             row = self._row(k)
-            if row[7] + row[0] < self.n and r.right() + 8 < self._x(self.n - 1):
+            if row[7] + row[0] < self.n and not row[11] and r.right() + 8 < self._x(self.n - 1):
                 rest = QtCore.QRectF(r.right() + 3, r.top(), self._x(self.n - 1) + cw / 2 - r.right() - 4.5, r.height())
                 p.setPen(QtGui.QPen(QtGui.QColor(ui.BORDER), 1, QtCore.Qt.DashLine))
                 p.setBrush(QtCore.Qt.NoBrush)
@@ -2135,7 +2141,7 @@ class Timeline(QtWidgets.QWidget):
         return QtCore.QRectF(op_rect.left() + 4, op_rect.center().y() - 1.5, op_rect.width() - 38, 3)
 
     def _layer_bar(self, p, k, r, fm, ghost=False):
-        n, name, tag, vis, mode, op, split, off, ev, chan = self._row(k)
+        n, name, tag, vis, mode, op, split, off, ev, chan = self._row(k)[:10]
         P = self._parts(k, r)
         text = name + (f"  ·  {off:+d} fr" if off else "") + (f"  ·  {ev:+.1f} EV" if ev else "")
         lefts = [v.left() for key, v in P.items() if key != "grip" and v.left() > r.center().x() - 11]
@@ -2216,6 +2222,13 @@ class Timeline(QtWidgets.QWidget):
         if k is None:
             return None
         r = self._layer_rect(k)
+        if not (r.left() - 3 <= pos.x() <= r.right() + 3):
+            return None
+        if k < len(self.layers) and r.width() > 30:  # за край полоски — обрезать слой с начала / с конца
+            if abs(pos.x() - r.left()) <= 4:
+                return k, "trim_l"
+            if abs(pos.x() - r.right()) <= 4:
+                return k, "trim_r"
         if not (r.left() <= pos.x() <= r.right()):
             return None
         P = self._parts(k, r)
@@ -2229,6 +2242,110 @@ class Timeline(QtWidgets.QWidget):
     def _op_at(self, k, x):
         tr = self._op_track(self._parts(k, self._layer_rect(k))["op"])
         return max(0, min(100, round((x - tr.left()) / max(1.0, tr.width()) * 20) * 5)) / 100
+
+    def _bx(self, f):
+        """x границы перед кадром f (между f-1 и f)."""
+        return self.PAD + self._cw() * f
+
+    def _snap_targets(self, skip):
+        """Границы, к которым липнут края полосок: начало и конец A, In / Out, плейхед, стыки клипов, края других слоёв."""
+        t = {0, self.n, self.frame}
+        if self.io:
+            t |= {self.io[0], self.io[1] + 1}
+        for o, n, _ in self.clips or []:
+            t |= {o, o + n}
+        for j in range(len(self.layers)):
+            if j != skip:
+                row = self._row(j)
+                t |= {row[7], row[7] + row[0]}
+        return t
+
+    def _snap(self, edges, skip):
+        """edges — края полоски (в кадрах). Ближайшая граница в пределах 7 px: (на сколько кадров сдвинуть, граница)."""
+        best = None
+        for e in edges:
+            for t in self._snap_targets(skip):
+                d = abs(self._bx(e) - self._bx(t))
+                if d <= 7 and (best is None or d < best[0]):
+                    best = (d, t - e, t)
+        return (best[1], best[2]) if best else (0, None)
+
+    def _edit_zone(self, pos):
+        """Полоску несут вниз, на A / дорожку клипов, к левому или правому краю — в начало или конец монтажа."""
+        bottom = (self._lane_y() if self.clips else self.BASE - 2.0 + self.LANE * len(self.layers)) - 2
+        if pos.y() < bottom:
+            return None
+        return "start" if pos.x() < self.width() * 0.2 else "end" if pos.x() > self.width() * 0.8 else None
+
+    EDGE_DROP = 90  # ширина зон «в начало / в конец монтажа» при броске файла на таймлайн
+
+    def drop_target(self, pos):
+        """Файл бросают на таймлайн: края — в начало / конец монтажа, остальное — слой с этого кадра."""
+        if pos.x() < self.EDGE_DROP:
+            return "start", 0
+        if pos.x() > self.width() - self.EDGE_DROP:
+            return "end", 0
+        f = max(0, min(self.n - 1, int(round((pos.x() - self.PAD) / max(1e-6, self._cw())))))
+        if abs(self._bx(f) - self._bx(self.frame)) <= 7:  # к плейхеду липнет,
+            f = self.frame
+        elif pos.x() < self.EDGE_DROP + 16:  # у самой зоны «в начало» — с первого кадра
+            f = 0
+        return "layer", f
+
+    def set_drop_hint(self, pos):
+        hint = None if pos is None else self.drop_target(pos)
+        if hint != self.drop_hint:
+            self.drop_hint = hint
+            self.update()
+
+    def _paint_hints(self, p, top):
+        """Жёлтая черта привязки, зоны «в начало / конец монтажа», подсказка броска файла."""
+        C = QtGui.QColor
+        h = self.height()
+        f = QtGui.QFont(self.font())
+        f.setPixelSize(10)
+        f.setBold(True)
+        if self.snap_at is not None:
+            p.fillRect(QtCore.QRectF(self._bx(self.snap_at) - 1, top - 4, 2, h - top + 4), C(ui.ACCENT))
+        zone, label = None, None
+        if self.drag_layer is not None and self.drag_layer[6] == "v" and self.drag_layer[0] < len(self.layers):
+            zone = self._edit_zone(QtCore.QPointF(self.drag_layer[5], self.drag_layer[2]))
+            label = {"start": "Start of the edit", "end": "End of the edit"}.get(zone)
+        elif self.drop_hint is not None:
+            kind, fr = self.drop_hint
+            if kind in ("start", "end"):
+                zone = kind
+                label = {"start": "+  Start of the edit", "end": "+  End of the edit"}[kind]
+            else:
+                x = self._bx(fr)
+                p.fillRect(QtCore.QRectF(x - 1, top - 4, 2, h - top + 4), C(ui.ACCENT))
+                txt = f"+  Layer from frame {self.numbers[min(fr, len(self.numbers) - 1)]}"
+                fm = QtGui.QFontMetricsF(f)
+                w = fm.horizontalAdvance(txt) + 16
+                r = QtCore.QRectF(min(max(4.0, x + 6), self.width() - w - 4), 1, w, 16)
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(C(ui.ACCENT))
+                p.drawRoundedRect(r, 8, 8)
+                p.setFont(f)
+                p.setPen(C(ui.ON_ACCENT))
+                p.drawText(r, QtCore.Qt.AlignCenter, txt)
+        if zone:
+            w = self.EDGE_DROP if self.drop_hint else self.width() * 0.2
+            r = QtCore.QRectF(0 if zone == "start" else self.width() - w, 0, w, h)
+            tint = C(ui.ACCENT)
+            tint.setAlpha(46)
+            p.fillRect(r, tint)
+            edge = r.left() + 1 if zone == "start" else r.right() - 3
+            p.fillRect(QtCore.QRectF(edge, 0, 2, h), C(ui.ACCENT))
+            if label:  # плашкой поверх номеров кадров, чтобы читалось
+                p.setFont(f)
+                lw = QtGui.QFontMetricsF(f).horizontalAdvance(label) + 16
+                pr = QtCore.QRectF(r.left() + 6 if zone == "start" else r.right() - 6 - lw, 1, lw, 16)
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(C(ui.ACCENT))
+                p.drawRoundedRect(pr, 8, 8)
+                p.setPen(C(ui.ON_ACCENT))
+                p.drawText(pr, QtCore.Qt.AlignCenter, label)
 
     def _layer_slot(self, y):
         return max(0, min(self._rows() - 1, int((y - self.BASE + 3) // self.LANE)))
@@ -2475,6 +2592,7 @@ class Timeline(QtWidgets.QWidget):
         p.setFont(fb)
         p.setPen(C(ui.ON_ACCENT))
         p.drawText(pill, QtCore.Qt.AlignCenter, txt)
+        self._paint_hints(p, top)
         p.end()
 
     def mousePressEvent(self, e):
@@ -2500,6 +2618,11 @@ class Timeline(QtWidgets.QWidget):
                 if what == "op":
                     self.drag_op = k
                     self.layer_opacity.emit(k, self._op_at(k, e.position().x()))
+                    return
+                if what in ("trim_l", "trim_r"):
+                    row = self._row(k)
+                    self.drag_trim = (k, what, e.position().x(), row[10], row[11], row[7], row[12])
+                    self.setCursor(QtCore.Qt.SizeHorCursor)
                     return
                 x, y = e.position().x(), e.position().y()
                 self.drag_layer = [k, y, y, what == "grip", x, x, None, self._row(k)[7]]
@@ -2535,6 +2658,27 @@ class Timeline(QtWidgets.QWidget):
         if self.drag_op is not None:
             self.layer_opacity.emit(self.drag_op, self._op_at(self.drag_op, e.position().x()))
             return
+        if self.drag_trim is not None:
+            k, side, x0, tin0, tout0, off0, full = self.drag_trim
+            d = int(round((e.position().x() - x0) / max(1e-6, self._cw())))
+            if side == "trim_l":  # левый край: срез с начала, правый край слоя стоит на месте
+                tin = max(0, min(full - tout0 - 1, tin0 + d))
+                ds, self.snap_at = self._snap([off0 + tin - tin0], k)
+                tin = max(0, min(full - tout0 - 1, tin + ds))
+                tout, off = tout0, off0 + tin - tin0
+                tip = f"trim start: {tin} fr  ·  starts at frame {self.numbers[max(0, min(self.n - 1, off))]}"
+            else:  # правый край: срез с конца
+                tout = max(0, min(full - tin0 - 1, tout0 - d))
+                ds, self.snap_at = self._snap([off0 + full - tin0 - tout], k)
+                tout = max(0, min(full - tin0 - 1, tout - ds))
+                tin, off = tin0, off0
+                tip = f"trim end: {tout} fr  ·  {full - tin - tout} of {full} frames"
+            row = self._row(k)
+            if (tin, tout, off) != (row[10], row[11], row[7]):
+                self.layer_trim.emit(k, tin, tout, off)
+            QtWidgets.QToolTip.showText(e.globalPosition().toPoint(), tip, self)
+            self.update()
+            return
         if self.drag_layer is not None:
             D = self.drag_layer
             D[2], D[5] = e.position().y(), e.position().x()
@@ -2545,10 +2689,8 @@ class Timeline(QtWidgets.QWidget):
             if D[6] == "h":
                 n = self._row(D[0])[0]
                 off = D[7] + int(round(dx / max(1e-6, self._cw())))
-                for snap in (0, self.frame):  # липнет к началу и к плейхеду
-                    if abs(self._x(off) - self._x(snap)) <= 6:
-                        off = snap
-                off = max(-(n - 1), min(self.n - 1, off))
+                ds, self.snap_at = self._snap([off, off + n], D[0])  # начало или конец липнет к краям
+                off = max(-(n - 1), min(self.n - 1, off + ds))
                 if off != self._row(D[0])[7]:
                     self.layer_offset.emit(D[0], off)
                 QtWidgets.QToolTip.showText(e.globalPosition().toPoint(),
@@ -2566,9 +2708,9 @@ class Timeline(QtWidgets.QWidget):
             what = part[1] if part else None
             self.setCursor(QtCore.Qt.PointingHandCursor if what in ("grip", "close", "eye", "mode", "chan", "info", "split",
                                                                     "adjust")
-                           else QtCore.Qt.SizeHorCursor if what == "op"
+                           else QtCore.Qt.SizeHorCursor if what in ("op", "trim_l", "trim_r")
                            else QtCore.Qt.OpenHandCursor if what else QtCore.Qt.ArrowCursor)
-            n, name, tag, vis, mode, op, split, off, ev, chan = self._row(k)
+            n, name, tag, vis, mode, op, split, off, ev, chan = self._row(k)[:10]
             info = f"{tag}  {name}  ·  {n} frames{'' if vis else '  ·  hidden'}" + (f"  ·  shifted {off:+d} fr" if off else "")
             if k >= len(self.layers):
                 info += "  ·  base clip — drag it up into the stack to make another clip the base"
@@ -2578,11 +2720,13 @@ class Timeline(QtWidgets.QWidget):
                              "mode": f"Blend mode: {mode}", "op": f"Opacity {round(op * 100)}% — drag to change",
                              "chan": f"Channel: {chan} — channels and EXR layers (AOV) of this clip",
                              "info": "Metadata", "split": "Split compare — " + ("on" if split else "off"),
-                             "adjust": f"Brightness {ev:+.1f} EV · opacity · blend mode"
+                             "adjust": f"Brightness {ev:+.1f} EV · opacity · blend mode",
+                             "trim_l": "Drag to trim the start of the layer", "trim_r": "Drag to trim the end of the layer"
                              }.get(what, f"{info}\n" + ("Drag up / down to reorder · right-click for settings"
                                                           if k >= len(self.layers) else
                                                           "Drag left / right to shift in time · up / down to reorder"
-                                                          " · right-click for settings")))
+                                                          " · down to the left / right end — into the edit"
+                                                          " · edges — trim · right-click for settings")))
             return
         if self._in_lane(e.position()):
             k = self._clip_at(e.position().x())
@@ -2609,6 +2753,11 @@ class Timeline(QtWidgets.QWidget):
         if self.drag_io is not None:
             self.drag_io = None
             return
+        if self.drag_trim is not None:
+            self.drag_trim = None
+            self.snap_at = None
+            self.update()
+            return
         if self.drag_op is not None:
             self.drag_op = None
             self.update()
@@ -2616,8 +2765,12 @@ class Timeline(QtWidgets.QWidget):
         if self.drag_layer is not None:
             k, y0, y, grip, x0, x, axis, off0 = self.drag_layer
             self.drag_layer = None
+            self.snap_at = None
             self.setCursor(QtCore.Qt.OpenHandCursor)
-            if axis == "v":
+            zone = self._edit_zone(QtCore.QPointF(x, y)) if axis == "v" and k < len(self.layers) else None
+            if zone:
+                self.layer_to_edit.emit(k, zone == "start")
+            elif axis == "v":
                 t = self._layer_slot(y)
                 if t != k:
                     self.layer_moved.emit(k, t)
@@ -3162,8 +3315,10 @@ class DropOverlay(QtWidgets.QWidget):
 class Layer:
     """Клип поверх кадра A: свой загрузчик кадров + как он ложится (прозрачность, режим, видимость, шторка)."""
 
-    def __init__(self, src, loader, opacity=1.0, mode="Normal", visible=True, split=False, offset=0, ev=0.0, aov=None, channel="RGB"):
+    def __init__(self, src, loader, opacity=1.0, mode="Normal", visible=True, split=False, offset=0, ev=0.0, aov=None, channel="RGB",
+                 trim_in=0, trim_out=0):
         self.src, self.loader = src, loader
+        self.trim_in, self.trim_out = trim_in, trim_out  # сколько кадров слоя срезано с начала и с конца
         self.opacity, self.mode, self.visible, self.split = opacity, mode, visible, split
         self.offset = offset  # с какого кадра A слой начинается (сдвиг по таймлайну, может быть < 0)
         self.ev = ev  # яркость слоя в стопах — поверх общей экспозиции
@@ -3176,10 +3331,22 @@ class Layer:
     def name(self):
         return self.src.file_label
 
+    @property
+    def length(self):
+        """Сколько кадров слоя видно после обрезки."""
+        return max(1, self.src.n - self.trim_in - self.trim_out)
+
     def index(self, i):
-        """Кадр слоя для кадра i с учётом сдвига: до начала слоя — None (его нет), короткий держит последний кадр."""
+        """Кадр слоя для кадра i с учётом сдвига и обрезки: до начала — None (слоя нет); после конца
+        обрезанный с конца слой исчезает, необрезанный держит последний кадр."""
         j = i - self.offset
-        return None if j < 0 else min(j, self.src.n - 1)
+        if j < 0:
+            return None
+        if j >= self.length:
+            if self.trim_out:
+                return None
+            j = self.length - 1
+        return j + self.trim_in
 
 
 class Player(QtWidgets.QMainWindow):
@@ -3226,6 +3393,9 @@ class Player(QtWidgets.QMainWindow):
         self.timeline.layer_offset.connect(lambda k, v: self.set_layer(self._layer_at(k), offset=v)
                                            if self._layer_at(k) is not self.base_look else None)
         self.timeline.layer_chan.connect(lambda k, pos: self.chan_menu(self._layer_at(k), pos))
+        self.timeline.layer_trim.connect(lambda k, a, b, off: self.set_layer(self._layer_at(k), trim_in=a, trim_out=b, offset=off)
+                                         if self._layer_at(k) is not self.base_look else None)
+        self.timeline.layer_to_edit.connect(lambda k, start: self.layer_to_edit(self._layer_at(k), start))
         self.timeline.layer_popup.connect(lambda k, what, pos: (self.info_popup if what == "info" else self.look_menu)(
             self._layer_at(k), pos))
         self.timeline.io_changed.connect(self.set_io)
@@ -3685,12 +3855,31 @@ class Player(QtWidgets.QMainWindow):
         return (self.viewer.tool == "image" and self.viewer.img is not None and len(paths) == 1
                 and os.path.splitext(paths[0])[1].lower() in IMG_EXT | {".gif"})
 
+    def _accept_drop(self, e):
+        """Строку из своего плейлиста — копией (иначе список её удалит), файлы из Проводника — как предложено."""
+        if e.source() is not None:
+            e.setDropAction(QtCore.Qt.CopyAction)
+            e.accept()
+        else:
+            e.acceptProposedAction()
+
+    def _over_timeline(self, e):
+        """Точка броска на таймлайне (в его координатах) или None; пока ничего не открыто — таймлайна нет."""
+        if not self.src:
+            return None
+        pt = self.timeline.mapFrom(self, e.position().toPoint())
+        return QtCore.QPointF(pt) if self.timeline.rect().contains(pt) else None
+
     def dragEnterEvent(self, e):
         paths = self._drop_paths(e)
         if not paths:
             return
-        e.acceptProposedAction()
+        self._accept_drop(e)
         if self._ref_drop(e):
+            return
+        if (pt := self._over_timeline(e)) is not None:
+            self.drop.hide()
+            self.timeline.set_drop_hint(pt)
             return
         self.drop.setGeometry(QtCore.QRect(self.left_col.mapTo(self, QtCore.QPoint(0, 0)), self.left_col.size()))
         self.drop.count = len(paths)
@@ -3701,9 +3890,20 @@ class Player(QtWidgets.QMainWindow):
         self.drop.raise_()
 
     def dragMoveEvent(self, e):
-        e.acceptProposedAction()
+        self._accept_drop(e)
         if self._ref_drop(e):
             return
+        if (pt := self._over_timeline(e)) is not None:
+            self.drop.hide()
+            self.timeline.set_drop_hint(pt)
+            return
+        self.timeline.set_drop_hint(None)
+        if not self.drop.isVisible():
+            self.drop.setGeometry(QtCore.QRect(self.left_col.mapTo(self, QtCore.QPoint(0, 0)), self.left_col.size()))
+            self.drop.count = len(self._drop_paths(e))
+            self.drop.has_media = self.src is not None
+            self.drop.show()
+            self.drop.raise_()
         side = self._drop_side(e)
         if side != self.drop.side:
             self.drop.side = side
@@ -3711,13 +3911,22 @@ class Player(QtWidgets.QMainWindow):
 
     def dragLeaveEvent(self, e):
         self.drop.hide()
+        self.timeline.set_drop_hint(None)
 
     def dropEvent(self, e):
         self.drop.hide()
+        self.timeline.set_drop_hint(None)
         paths = self._drop_paths(e)
         if not paths:
             return
-        e.acceptProposedAction()
+        self._accept_drop(e)
+        if not self._ref_drop(e) and (pt := self._over_timeline(e)) is not None:
+            kind, frame = self.timeline.drop_target(pt)
+            if kind == "layer":
+                QtCore.QTimer.singleShot(0, lambda: self.layer_paths_at(paths, frame))
+            else:
+                QtCore.QTimer.singleShot(0, lambda: self.edit_paths(paths, kind == "start"))
+            return
         if self._ref_drop(e):
             img = self.load_ref(paths[0])
             pos = self.viewer._norm(self.viewer.mapFrom(self, e.position().toPoint()).toPointF())
@@ -4048,14 +4257,14 @@ class Player(QtWidgets.QMainWindow):
         if ps:
             self.layer_paths(ps)
 
-    def add_layers(self, srcs):
+    def add_layers(self, srcs, offset=0):
         """Каждый клип — новый слой сверху: Normal 100%, без шторки (сравнение включается иконкой на полоске)."""
         srcs = [s_ for s_ in srcs if s_ is not None]
         if not srcs or not self.src:
             return
         self.stop()
         for src in srcs:
-            L = Layer(src, None)
+            L = Layer(src, None, offset=offset)
             L.loader = loader = Loader(src, self.budget // 4, self._params(L), alpha=True)
             loader.bridge.ready.connect(lambda j, L=L: self.on_layer_ready(L, j))
             self.layers.append(L)
@@ -4089,8 +4298,8 @@ class Player(QtWidgets.QMainWindow):
 
     def _layers_timeline(self):
         B = self.base_look
-        self.timeline.set_layers([(L.src.n, L.name, L.tag, L.visible, L.mode, L.opacity, L.split, L.offset, L.ev,
-                                   self._chan_label(L)) for L in reversed(self.layers)],
+        self.timeline.set_layers([(L.length, L.name, L.tag, L.visible, L.mode, L.opacity, L.split, L.offset, L.ev,
+                                   self._chan_label(L), L.trim_in, L.trim_out, L.src.n) for L in reversed(self.layers)],
                                  self.src.file_label if self.src else "",
                                  (B.visible, B.mode, B.opacity, B.ev, self._chan_label(B)))
 
@@ -4188,6 +4397,12 @@ class Player(QtWidgets.QMainWindow):
         m.addAction("Move down — below A makes it the base" if k == 0 else "Move down", lambda: self.layer_action(L, "down"))
         m.addAction(f"Swap {L.tag} and A", lambda: self.layer_action(L, "swap"))
         m.addAction("Reset split", self.viewer.reset_wipe).setEnabled(L.split)
+        m.addAction(f"Reset trim  ({L.trim_in} / {L.trim_out} fr)" if L.trim_in or L.trim_out else "Reset trim",
+                    lambda: self.set_layer(L, trim_in=0, trim_out=0, offset=L.offset - L.trim_in)
+                    ).setEnabled(bool(L.trim_in or L.trim_out))
+        m.addSeparator()
+        m.addAction("Put at the start of the edit — plays before A", lambda: self.layer_to_edit(L, True))
+        m.addAction("Put at the end of the edit — plays after A", lambda: self.layer_to_edit(L, False))
         m.addSeparator()
         m.addAction("Remove layer", lambda: self.layer_action(L, "remove"))
         popup_above(m, pos)
@@ -4309,6 +4524,9 @@ class Player(QtWidgets.QMainWindow):
             a = max(0, L.offset)
             rows.append(("Offset", f"{L.offset:+d} fr   ·   starts at frame {self.src.numbers[min(a, self.src.n - 1)]} of A"
                          if L.offset else "in sync with A"))
+            if L.trim_in or L.trim_out:
+                rows.append(("Trim", f"{L.trim_in} fr from the start   ·   {L.trim_out} fr from the end   ·   "
+                                     f"{L.length} of {clip.n} frames"))
         rows.insert(0, ("Layer", L.tag))
         k = len(self.layers) if base else len(self.layers) - 1 - self.layers.index(L)  # полоска на таймлайне
         if not hasattr(self, "_info_pop"):
@@ -4359,7 +4577,9 @@ class Player(QtWidgets.QMainWindow):
                 loader.set_params(self._params(L))
                 if L is not self.base_look:  # старая картинка висит, пока не готова новая
                     loader.set_playhead(L.index(self.frame) or 0)
-        if redecode or "offset" in kw:
+        if redecode or "offset" in kw or "trim_in" in kw or "trim_out" in kw:
+            if "trim_in" in kw and L is not self.base_look and L.loader:
+                L.loader.set_playhead(L.index(self.frame) or L.trim_in)
             self.show_frame(self.frame)
         self.layer_changed(L)
 
@@ -4429,6 +4649,53 @@ class Player(QtWidgets.QMainWindow):
         self.layers[k] = new
         self._layers_changed()
         self.show_frame(self.frame)
+
+    def layer_to_edit(self, L, at_start):
+        """Слой уходит из стопки в сам монтаж: в начало (играет до A) или в конец (после)."""
+        if L is self.base_look or L not in self.layers:
+            return
+        clips = self.clips()
+        if any(c.sidecar == L.src.sidecar for c in clips):
+            self.statusBar().showMessage(f"{L.name} is already in the edit", 3500)
+            return
+        trimmed = bool(L.trim_in or L.trim_out)
+        L.loader.close()
+        self.layers.remove(L)
+        self._insert_clips([L.src], at_start)
+        self.statusBar().showMessage(f"{L.name} — {'start' if at_start else 'end'} of the edit"
+                                     + ("  ·  the whole clip: trim applies to layers only" if trimmed else ""), 4500)
+
+    def _insert_clips(self, srcs, at_start):
+        """Клипы — в начало или конец монтажа; слои остаются на своих кадрах A."""
+        clips = self.clips()
+        if at_start:
+            shift = sum(c.n for c in srcs)
+            for X in self.layers:  # A уехал вправо — слои вместе с ним
+                X.offset += shift
+            # In / Out остаются на тех же кадрах A (монтаж применит их при пересборке)
+            self.io_in, self.io_out = (None if v is None else v + shift for v in (self.io_in, self.io_out))
+            self._rebuild(srcs + clips)
+        else:
+            self._rebuild(clips + srcs)
+        self._layers_changed()
+        self.show_frame(self.frame)
+
+    def edit_paths(self, paths, at_start):
+        """Файлы, брошенные на край таймлайна: в начало или конец монтажа."""
+        if not self.src:
+            return self.open_paths(paths)
+        have = {c.sidecar for c in self.clips()}
+        new = [x for x in self._load(paths) if x.sidecar not in have]
+        if not new:
+            self.statusBar().showMessage("Already on the timeline", 2500)
+            return
+        self._insert_clips(new, at_start)
+
+    def layer_paths_at(self, paths, frame):
+        """Файлы, брошенные на таймлайн: слоями, которые начинаются с этого кадра."""
+        if not self.src:
+            return self.open_paths(paths)
+        self.add_layers(self._load(paths), offset=frame)
 
     def clear_layers(self):
         for L in self.layers:

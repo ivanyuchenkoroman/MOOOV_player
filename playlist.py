@@ -237,6 +237,16 @@ class PlaylistView(QtWidgets.QListWidget):
         r = self.visualItemRect(it)
         return self.row(it) + (1 if pos.y() > r.center().y() else 0)
 
+    def mimeData(self, items):
+        """Строку можно утащить из списка: на таймлайн (слоем или в монтаж) или на окно плеера."""
+        md = super().mimeData(items)
+        md.setUrls([QtCore.QUrl.fromLocalFile(it.data(PATH_ROLE)) for it in items if it.data(PATH_ROLE)])
+        return md
+
+    def startDrag(self, actions):
+        # копирование разрешено: брошенная на плеер строка остаётся в плейлисте
+        super().startDrag(actions | QtCore.Qt.CopyAction)
+
     def dragEnterEvent(self, e):
         if e.source() is not self and self._urls(e):
             e.acceptProposedAction()
@@ -534,7 +544,7 @@ class PlaylistPanel(QtWidgets.QFrame):
 
     # бросили на панель мимо списка
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        if e.mimeData().hasUrls() and e.source() is not self.view:  # своя строка мимо списка — не дублировать
             e.acceptProposedAction()
 
     def dropEvent(self, e):
