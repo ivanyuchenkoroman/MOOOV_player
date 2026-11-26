@@ -367,8 +367,13 @@ def export_pdf(path, items, get_image, file_label, timecode, progress=None, matt
     m = W * 0.025
     bg, fg, dim, muted = (QtGui.QColor(c) for c in (ui.SURFACE, ui.TEXT, ui.DIM, ui.MUTED))
 
+    # обычный (не переменный) шрифт: Segoe UI Variable, которым рисуется интерфейс, Qt вшивает в PDF так,
+    # что Acrobat (Font Capture) падает при открытии
+    fams = set(QtGui.QFontDatabase.families())
+    pdf_family = next((f_ for f_ in ("Segoe UI", "Helvetica Neue", "Arial") if f_ in fams), None)
+
     def font(px, bold=False, weight=None):
-        f = QtGui.QFont()
+        f = QtGui.QFont(pdf_family) if pdf_family else QtGui.QFont()
         f.setPixelSize(int(px))
         if weight is not None:
             f.setWeight(weight)
@@ -376,6 +381,7 @@ def export_pdf(path, items, get_image, file_label, timecode, progress=None, matt
             f.setBold(bold)
         return f
 
+    p.setFont(font(12))  # номера на кадре (paint_badge) берут шрифт художника — тоже обычный
     blurb = "Reviewed in MOOOV_player — a fast player for VFX review by mooov.team"  # если текста нет
     cap_h = H * 0.03              # капсула с номером кадра
     D = cap_h                     # кружок с номером — соразмерно лого справа и капсуле
@@ -458,7 +464,7 @@ def export_pdf(path, items, get_image, file_label, timecode, progress=None, matt
             blurb_n = blurb
         px = H * 0.034 if text else H * 0.022  # подпись плеера — тише настоящего комментария
         while True:
-            ft = font(px, weight=QtGui.QFont.Medium)
+            ft = font(px, weight=QtGui.QFont.DemiBold)  # у обычного Segoe UI нет Medium
             tr = QtGui.QFontMetricsF(ft).boundingRect(QtCore.QRectF(0, 0, tw, 10 * H), QtCore.Qt.TextWordWrap,
                                                       text or blurb_n)
             if tr.height() <= maxh or px <= H * 0.016:
