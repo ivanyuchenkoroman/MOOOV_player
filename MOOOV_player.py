@@ -1366,7 +1366,8 @@ class Viewer(QOpenGLWidget):
     badge_clicked = QtCore.Signal(object)  # клик по номеру комментария на кадре
     image_requested = QtCore.Signal(object)  # инструмент Image: клик по пустому месту — добавить картинку
     image_edited = QtCore.Signal(object)  # картинку подвинули / отмасштабировали (заметка)
-    HANDLE = 7  # радиус ручек масштаба у выбранной картинки
+    HANDLE = 7  # радиус, за который хватаются ручки масштаба у выбранной картинки
+    HANDLE_DRAW = 4.0  # а рисуются они меньше — аккуратные кружки
     BADGE_R = 8  # номер на кадре — маленький и полупрозрачный, ярче при наведении
 
     def __init__(self):
@@ -1684,13 +1685,18 @@ class Viewer(QOpenGLWidget):
         r = ann.image_rect(self.sel_img, t)
         acc = QtGui.QColor(ui.ACCENT)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        p.setPen(QtGui.QPen(acc, 1.5))
+        # тонкая рамка точно по пикселям экрана (полпикселя — линия не размывается на два)
+        dpr = self.devicePixelRatioF()
+        snap = lambda v: (round(v * dpr) + 0.5) / dpr
+        rr = QtCore.QRectF(QtCore.QPointF(snap(r.left()), snap(r.top())), QtCore.QPointF(snap(r.right()), snap(r.bottom())))
+        p.setPen(QtGui.QPen(acc, 1.0 / dpr * max(1, round(dpr))))
         p.setBrush(QtCore.Qt.NoBrush)
-        p.drawRect(r)
-        p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160), 1.2))
+        p.drawRect(rr)
+        # ручки — небольшие кружки: тёмная обводка, жёлтая заливка (хватать можно с запасом — HANDLE)
+        p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 150), 1.0))
         p.setBrush(acc)
-        for c in self._corners(r):
-            p.drawEllipse(c, self.HANDLE / 1.4, self.HANDLE / 1.4)
+        for c in self._corners(rr):
+            p.drawEllipse(c, self.HANDLE_DRAW, self.HANDLE_DRAW)
 
     def _norm(self, pos):
         t = self._target()
@@ -5617,6 +5623,7 @@ def main():
 
     fmt = QtGui.QSurfaceFormat()
     fmt.setSwapInterval(0)
+    fmt.setSamples(4)  # сглаживание в окне кадра: ручки, ластик, линии рисунка без «лесенки»
     QtGui.QSurfaceFormat.setDefaultFormat(fmt)
     app = App(sys.argv)
     app.setApplicationName("MOOOV_player")
