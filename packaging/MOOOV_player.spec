@@ -15,7 +15,8 @@ IMAGES = ["exr", "png", "jpg", "jpeg", "tif", "tiff", "hdr", "bmp", "webp"]
 a = Analysis(
     [os.path.join(ROOT, "MOOOV_player.py")],
     pathex=[ROOT],
-    datas=[(os.path.join(ROOT, "RELEASE_NOTES.md"), ".")],  # окно Help → What's New
+    datas=[(os.path.join(ROOT, "RELEASE_NOTES.md"), "."),  # окно Help → What's New
+           (os.path.join(ROOT, "stickers"), "stickers")],  # набор стикеров для рисования
     excludes=[  # не нужны плееру — меньше размер
         "tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtQuick",
         "PySide6.QtQml", "PySide6.Qt3DCore", "PySide6.QtMultimedia", "PySide6.QtCharts",

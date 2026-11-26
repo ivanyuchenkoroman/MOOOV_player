@@ -442,6 +442,13 @@ def _draw(p, name):
             p.drawRoundedRect(QtCore.QRectF(3, 5, 12, 8), 1, 1)
         elif name == "ellipse":
             p.drawEllipse(QtCore.QRectF(3, 4.5, 12, 9))
+        elif name == "sticker":  # стикеры: звезда
+            pts = []
+            for i in range(10):
+                r = 6.6 if i % 2 == 0 else 2.9
+                a = math.radians(-90 + i * 36)
+                pts.append(P(9 + r * math.cos(a), 9.6 + r * math.sin(a)))
+            p.drawPolygon(QtGui.QPolygonF(pts))
         elif name == "eraser":  # ластик наискосок, полоска-манжета и линия стёртого
             path = QtGui.QPainterPath(P(2.8, 11.2))
             path.lineTo(9.3, 4.7)

@@ -26,6 +26,7 @@ class Stroke:
     alpha: float = 1.0  # непрозрачность штриха / картинки (0.25 … 1)
 
 
+STICKER = "sticker"  # «цвет» картинки-стикера: рисуется без рамки
 SKETCH_TEXT = "Sketch on frame"  # подпись комментария-рисунка без текста (в плеере и в PDF)
 REF_MAX = 1600  # длинная сторона референса в комментарии — хватает для экрана и PDF, JSON не раздувается
 _IMG_CACHE = {}
@@ -244,8 +245,9 @@ def paint_stroke(p, s, rect, opacity=1.0):
         img = stroke_image(s)
         if not img.isNull():
             p.drawImage(r, img)
-        p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 140), 1))  # тонкая рамка — картинка не сливается с кадром
-        p.drawRect(r)
+        if s.color != STICKER:  # тонкая рамка — картинка не сливается с кадром; у стикера своя белая обводка
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 140), 1))
+            p.drawRect(r)
         p.restore()
         return
     if s.tool == "pen" and any(len(q) > 2 for q in s.pts):  # нарисовано пером с нажимом

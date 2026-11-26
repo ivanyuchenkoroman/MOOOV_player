@@ -18,7 +18,7 @@ from collections import deque
 
 import cv2
 import numpy as np
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 import annotations as ann
@@ -1150,6 +1150,111 @@ class NoteBubble(QtWidgets.QFrame):
         return False
 
 
+STICKER_EXT = (".svg", ".png", ".webp", ".jpg", ".jpeg")
+
+
+def sticker_dirs():
+    """Набор плеера (внутри сборки / рядом с кодом) и своя папка пользователя — в неё можно докладывать."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    mine = os.path.join(QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation), "stickers")
+    return [os.path.join(base, "stickers"), mine]
+
+
+def list_stickers():
+    """[(имя, путь)] всех стикеров: сначала набор плеера, потом свои."""
+    out, seen = [], set()
+    for d in sticker_dirs():
+        try:
+            names = sorted(os.listdir(d), key=str.lower)
+        except OSError:
+            continue
+        for f in names:
+            stem, ext = os.path.splitext(f)
+            if ext.lower() in STICKER_EXT and stem.lower() not in seen:
+                seen.add(stem.lower())
+                out.append((stem.replace("_", " "), os.path.join(d, f)))
+    return out
+
+
+_STICKER_IMG = {}
+
+
+def sticker_image(path, px=512):
+    """Стикер картинкой с прозрачным фоном, длинная сторона — px (SVG рисуем в этом размере, чётко)."""
+    key = (path, px)
+    if key not in _STICKER_IMG:
+        if path.lower().endswith(".svg"):
+            r = QtSvg.QSvgRenderer(path)
+            sz = r.defaultSize()
+            if not r.isValid() or sz.isEmpty():
+                return None
+            k = px / max(sz.width(), sz.height())
+            img = QtGui.QImage(max(1, round(sz.width() * k)), max(1, round(sz.height() * k)),
+                               QtGui.QImage.Format_ARGB32_Premultiplied)
+            img.fill(QtCore.Qt.transparent)
+            p = QtGui.QPainter(img)
+            p.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
+            r.render(p)
+            p.end()
+        else:
+            img = QtGui.QImage(path)
+            if img.isNull():
+                return None
+            img = img.scaled(px, px, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        _STICKER_IMG[key] = img.convertToFormat(QtGui.QImage.Format_ARGB32)
+    return _STICKER_IMG[key]
+
+
+class StickerPicker(QtWidgets.QFrame):
+    """Всплывающая сетка стикеров под кнопкой-звездой."""
+    picked = QtCore.Signal(str)
+    COLS, CELL = 5, 64
+
+    def __init__(self, parent, current=None):
+        super().__init__(parent, QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        self.setObjectName("stickerPicker")
+        self.setStyleSheet(f"#stickerPicker {{ background: {ui.SURFACE}; border: 1px solid {ui.BORDER_HI};"
+                           f" border-radius: {ui.RADIUS_CARD}px; }}"
+                           f" QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 10px; }}"
+                           f" QToolButton:hover {{ background: {ui.CONTROL}; }}"
+                           f" QToolButton:checked {{ background: {ui.ACCENT_TINT}; border-color: {ui.ACCENT_LINE}; }}")
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(10, 10, 10, 8)
+        v.setSpacing(6)
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(4)
+        items = list_stickers()
+        for k, (name, path) in enumerate(items):
+            img = sticker_image(path, 128)
+            if img is None:
+                continue
+            b = QtWidgets.QToolButton()
+            b.setCheckable(True)
+            b.setChecked(path == current)
+            b.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(img)))
+            b.setIconSize(QtCore.QSize(self.CELL - 12, self.CELL - 12))
+            b.setFixedSize(self.CELL, self.CELL)
+            b.setToolTip(name)
+            b.setFocusPolicy(QtCore.Qt.NoFocus)
+            b.clicked.connect(lambda _=False, p_=path: (self.picked.emit(p_), self.close()))
+            grid.addWidget(b, k // self.COLS, k % self.COLS)
+        v.addLayout(grid)
+        if not items:
+            v.addWidget(QtWidgets.QLabel("No stickers yet"))
+        more = QtWidgets.QPushButton("Open my stickers folder…")
+        ui.small(more)
+        more.setToolTip("Put SVG or PNG files there — they show up here next time")
+        more.clicked.connect(self._open_folder)
+        v.addWidget(more)
+
+    def _open_folder(self):
+        d = sticker_dirs()[1]
+        os.makedirs(d, exist_ok=True)
+        ui.open_url(QtCore.QUrl.fromLocalFile(d))
+        self.close()
+
+
 class WinTab:
     """Нажим пера через Wintab (драйвер Wacom) напрямую. Qt 6 на Windows берёт перо только через
     Windows Ink; если в настройках Wacom Windows Ink выключен (так часто делают ради Photoshop/Nuke),
@@ -1315,7 +1420,7 @@ class Viewer(QOpenGLWidget):
     def set_tool(self, tool):
         self.tool = tool
         self._eraser_pos = None
-        if tool != "image":
+        if tool not in ("image", "sticker"):
             self.sel_img = None
         self.setCursor(QtCore.Qt.CrossCursor if tool else QtCore.Qt.ArrowCursor)
         self.update()
@@ -1572,7 +1677,7 @@ class Viewer(QOpenGLWidget):
         s.pts = [[min(ax, bx), min(ay, by)], [max(ax, bx), max(ay, by)]]
 
     def _paint_selection(self, p, t):
-        if self.tool != "image" or self.sel_img is None:
+        if self.tool not in ("image", "sticker") or self.sel_img is None:
             return
         if not any(s is self.sel_img for _, s in self.images_here()):
             return
@@ -1856,7 +1961,7 @@ class Viewer(QOpenGLWidget):
         if e.button() == QtCore.Qt.LeftButton and self._badge_at(e.position()) is not None:
             self.badge_clicked.emit(self._badge_at(e.position()))
             return
-        if (self.tool == "image" and self.img is not None and e.button() == QtCore.Qt.LeftButton
+        if (self.tool in ("image", "sticker") and self.img is not None and e.button() == QtCore.Qt.LeftButton
                 and not e.modifiers() & QtCore.Qt.AltModifier):
             hit = self._img_hit(e.position())
             if hit:
@@ -1916,7 +2021,7 @@ class Viewer(QOpenGLWidget):
             self._drag_image(e.position())
             self.update()
             return
-        if self.tool == "image" and self._drag is None and self.img is not None:
+        if self.tool in ("image", "sticker") and self._drag is None and self.img is not None:
             note = self._badge_at(e.position())
             if note is not self.hover_note:
                 self.hover_note = note
@@ -1928,7 +2033,7 @@ class Viewer(QOpenGLWidget):
             hit = self._img_hit(e.position())
             if hit is None:
                 self.setCursor(QtCore.Qt.CrossCursor)
-                self.setToolTip("Click to add a reference image")
+                self.setToolTip("Click to put the sticker" if self.tool == "sticker" else "Click to add a reference image")
             elif hit[0] == "move":
                 self.setCursor(QtCore.Qt.SizeAllCursor)
                 self.setToolTip("")
@@ -3467,6 +3572,8 @@ class Player(QtWidgets.QMainWindow):
         self.store = None
         self.active = None  # выбранная заметка
         self.settings = QtCore.QSettings("mooov", "mooov")
+        st = self.settings.value("sticker", "") or ""
+        self.sticker = st if st and os.path.exists(st) else None  # последний выбранный стикер
         ui.apply(QtWidgets.QApplication.instance())
 
         self.viewer = Viewer()
@@ -4926,10 +5033,14 @@ class Player(QtWidgets.QMainWindow):
         for key, tip in (("pen", "Brush (D)"), ("arrow", "Arrow"),
                          ("rect", "Rectangle"), ("ellipse", "Ellipse"),
                          ("eraser", f"Eraser (E) — drag over a drawing to erase it, {MOD}Z brings it back"),
+                         ("sticker", "Stickers — pick one, then click the frame to put it; drag to move, corners to scale"),
                          ("image", f"Reference image ({MOD}{'⇧' if sys.platform == 'darwin' else 'Shift+'}I, paste {MOD}V) — click the frame to add, drag to move, "
                                    "corners to scale, Delete to remove")):
             b = ui.icon_button(key, tip, checkable=True)
-            b.clicked.connect(lambda on, k=key: self.set_tool(k if on else None))
+            if key == "sticker":  # звезда — сначала выбрать стикер
+                b.clicked.connect(lambda _=False, b=b: self.pick_sticker(b))
+            else:
+                b.clicked.connect(lambda on, k=key: self.set_tool(k if on else None))
             self.tool_btns[key] = b
             tools.append(b)
         undo = ui.icon_button("undo", f"Undo stroke or erase ({MOD}Z)")
@@ -5036,7 +5147,7 @@ class Player(QtWidgets.QMainWindow):
 
     def set_tool(self, tool):
         if tool:
-            if tool not in ("image", "eraser"):  # D возвращает к рисованию, а не к ластику
+            if tool not in ("image", "eraser", "sticker"):  # D возвращает к рисованию, а не к ластику
                 self.last_tool = tool
             self.stop()
             self.draw_fold.set_open(True)
@@ -5060,9 +5171,39 @@ class Player(QtWidgets.QMainWindow):
                 return None
         return img if not img.isNull() else None
 
+    def pick_sticker(self, btn):
+        """Звезда: сетка стикеров; выбранный ставится кликом по кадру, пока инструмент включён."""
+        self.tool_btns["sticker"].setChecked(self.viewer.tool == "sticker")
+        pop = StickerPicker(self, getattr(self, "sticker", None))
+        pop.picked.connect(self.use_sticker)
+        pop.adjustSize()
+        g = btn.mapToGlobal(QtCore.QPoint(0, btn.height() + 6))
+        scr = (btn.screen() or QtGui.QGuiApplication.primaryScreen()).availableGeometry()
+        pop.move(max(scr.left() + 8, min(g.x(), scr.right() - pop.width() - 8)), g.y())
+        pop.show()
+
+    def use_sticker(self, path):
+        self.sticker = path
+        self.settings.setValue("sticker", path)
+        self.set_tool("sticker")
+        self.statusBar().showMessage(f"Sticker «{os.path.splitext(os.path.basename(path))[0].replace('_', ' ')}» — "
+                                     "click the frame to put it", 3500)
+
     def add_ref_image(self, pos=None, img=None):
         """Добавить картинку в комментарий текущего кадра (pos — место на кадре в долях)."""
         if not self.src or self.viewer.img is None:
+            return
+        if img is None and self.viewer.tool == "sticker":  # стикер — меньше референса, сразу из набора
+            img = sticker_image(getattr(self, "sticker", "") or "", 512) if getattr(self, "sticker", None) else None
+            if img is None:
+                return
+            fr = self.viewer.img
+            s = ann.image_stroke(img, pos or [0.5, 0.5], (fr.width(), fr.height()), height=0.2)
+            s.color = ann.STICKER
+            s.alpha = self.viewer.alpha
+            self.on_stroke(s)
+            self.viewer.sel_img = s
+            self.viewer.update()
             return
         if img is None:
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Add Reference Image",
@@ -5074,7 +5215,7 @@ class Player(QtWidgets.QMainWindow):
             if img is None:
                 self.statusBar().showMessage(f"Cannot open image: {os.path.basename(path)}", 4000)
                 return
-        if self.viewer.tool != "image":
+        if self.viewer.tool not in ("image", "sticker"):
             self._select_image_tool()
         fr = self.viewer.img
         s = ann.image_stroke(img, pos or [0.5, 0.5], (fr.width(), fr.height()))
@@ -5110,7 +5251,7 @@ class Player(QtWidgets.QMainWindow):
     def delete_ref_image(self):
         """Delete / Backspace с инструментом Image: убрать выбранную картинку. True — если убрали."""
         s = self.viewer.sel_img
-        if self.viewer.tool != "image" or s is None or not self.store:
+        if self.viewer.tool not in ("image", "sticker") or s is None or not self.store:
             return False
         for n in self.store.notes:
             if any(x is s for x in n.strokes):
