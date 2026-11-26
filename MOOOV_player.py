@@ -1000,7 +1000,7 @@ class InfoPopup(QtWidgets.QWidget):
 
     def mousePressEvent(self, e):
         if self.path and self._path_rect and self._path_rect.contains(e.position()):
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self.path))
+            ui.open_url(QtCore.QUrl.fromLocalFile(self.path))
         self.close()
 
     def hideEvent(self, e):
@@ -1786,10 +1786,10 @@ class Viewer(QOpenGLWidget):
                 self.setCursor(QtCore.Qt.ClosedHandCursor)
             return
         if e.button() == QtCore.Qt.LeftButton and self._on_path(e.position()) and self.info_path:
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self.info_path))
+            ui.open_url(QtCore.QUrl.fromLocalFile(self.info_path))
             return
         if e.button() == QtCore.Qt.LeftButton and self._on_site(e.position()):
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl(SITE_URL))
+            ui.open_url(QtCore.QUrl(SITE_URL))
             return
         if e.button() == QtCore.Qt.LeftButton and (w := self._wipe_hit(e.position())):
             self._wipe_drag = w
@@ -3633,7 +3633,7 @@ class Player(QtWidgets.QMainWindow):
         m.addAction(f"What's New in {'.'.join(APP_VERSION.split('.')[:2])}", self.show_release_notes)
         a = m.addAction("About MOOOV_player", self.show_about)
         a.setMenuRole(QtGui.QAction.AboutRole)  # на Mac уходит в меню приложения
-        m.addAction(f"Visit {SITE}", lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl(SITE_URL)))
+        m.addAction(f"Visit {SITE}", lambda: ui.open_url(QtCore.QUrl(SITE_URL)))
 
         QtWidgets.QApplication.instance().installEventFilter(self)  # пробел = Play/Stop везде
 
@@ -5288,7 +5288,7 @@ class Player(QtWidgets.QMainWindow):
             return
         finally:
             prog.close()
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+        ui.open_url(QtCore.QUrl.fromLocalFile(path))
 
     # ---- keys
     def keyPressEvent(self, e):

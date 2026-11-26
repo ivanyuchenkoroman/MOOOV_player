@@ -6,6 +6,28 @@ import tempfile
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+
+def open_url(url):
+    """Открыть файл, папку или ссылку внешней программой (Acrobat, Проводник, браузер).
+    Собранное PyInstaller приложение на Windows подменяет путь поиска DLL (SetDllDirectory), и запущенные
+    из него программы наследуют его: Acrobat грузил DLL плеера вместо своих, падал и держал папку плеера.
+    На время запуска путь возвращаем обычный."""
+    frozen = sys.platform == "win32" and getattr(sys, "frozen", False)
+    if frozen:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.SetDllDirectoryW(None)
+        mei = os.path.normcase(getattr(sys, "_MEIPASS", ""))
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join(x for x in old_path.split(os.pathsep)
+                                             if not (mei and os.path.normcase(x).startswith(mei)))
+    try:
+        return QtGui.QDesktopServices.openUrl(url)
+    finally:
+        if frozen:
+            os.environ["PATH"] = old_path
+            k32.SetDllDirectoryW(getattr(sys, "_MEIPASS", None))
+
 # ============================================================== MOOOV design system — токены
 # Бренд: жёлтый #FFD02B + чёрный. В интерфейсе бренд не «кричит»: жёлтый — единственный акцент
 # (всё активное: Play, фокус, выбранное, плейхед), буква M — только иконка, пустой экран и PDF.

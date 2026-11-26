@@ -536,7 +536,7 @@ class PlaylistPanel(QtWidgets.QFrame):
         m.addAction("Open", lambda: self.open_requested.emit(path))
         m.addAction("Add to Timeline", lambda: self.add_to_timeline.emit(path))
         reveal = "Reveal in Finder" if sys.platform == "darwin" else "Show in Explorer"
-        m.addAction(reveal, lambda: QtGui.QDesktopServices.openUrl(
+        m.addAction(reveal, lambda: ui.open_url(
             QtCore.QUrl.fromLocalFile(path if os.path.isdir(path) else os.path.dirname(path))))
         m.addSeparator()
         m.addAction("Remove from Playlist", lambda: self.remove(row))
