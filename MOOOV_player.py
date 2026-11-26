@@ -725,10 +725,12 @@ class Bridge(QtCore.QObject):
 
 
 class Loader:
-    """Пул потоков, который грузит кадры вперёд от плейхеда в кэш с лимитом по памяти.
+    """Пул потоков, который грузит кадры от плейхеда в кэш с лимитом по памяти: в основном вперёд,
+    плюс BACK_SEC секунд назад, чтобы можно было чуть отмотать без ожидания.
     Сетевые кадры — в два шага: файл докачивается кусками (warm), потом декодируется.
     На паузе кадр под плейхедом важнее всего: пока его нет, остальные докачки стоят."""
     playing = False  # Player ставит на Play / Stop: при проигрывании качаем всеми потоками подряд
+    BACK_SEC = 2.0  # сколько секунд позади плейхеда держать в кэше
 
     def __init__(self, source, budget_bytes, params, alpha=False):
         self.src = source
@@ -796,17 +798,33 @@ class Loader:
             return len(self.threads) * 2
         return max(2, min(self.n, int(self.budget // self.frame_bytes)))
 
+    def _wanted(self):
+        """Кадры, которые держим, по важности: секунда вперёд, BACK_SEC назад, дальше вперёд.
+        Назад — не больше трети окна, чтобы вперёд для проигрывания хватало всегда."""
+        w, n, ph = self._window(), self.n, self.playhead
+        fps = getattr(self.src, "fps", 24) or 24
+        back = max(0, min(int(round(self.BACK_SEC * fps)), w // 3, n - w if n > w else n - 1))
+        fwd = max(1, w - back)
+        first = min(fwd, max(len(self.threads) * 2, int(round(fps))))
+        out = [(ph + k) % n for k in range(first)]
+        out += [(ph - k) % n for k in range(1, back + 1)]
+        out += [(ph + k) % n for k in range(first, fwd)]
+        return out
+
     def _next_job(self):
-        for k in range(self._window()):
-            f = (self.playhead + k) % self.n
+        for f in self._wanted():
             if f not in self.cache and f not in self.inflight:
                 return f
         return None
 
     def _evict(self):
+        if self.used <= self.budget:
+            return
+        rank = {f: k for k, f in enumerate(self._wanted())}
+        ph, n = self.playhead, self.n
         while self.used > self.budget and self.cache:
-            ph, n = self.playhead, self.n
-            victim = max(self.cache, key=lambda f: (f - ph) % n)
+            # сначала то, что не нужно (дальше всего впереди), потом — наименее важное из нужного
+            victim = max(self.cache, key=lambda f: (f not in rank, rank.get(f, (f - ph) % n)))
             img = self.cache.pop(victim)
             if isinstance(img, QtGui.QImage):
                 self.used -= img.sizeInBytes()
