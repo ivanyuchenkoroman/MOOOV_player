@@ -1256,6 +1256,8 @@ def wintab(widget):
 
 class Viewer(QOpenGLWidget):
     stroke_done = QtCore.Signal(object)
+    erased = QtCore.Signal(object, object)  # ластик задел штрих: (нота, штрих)
+    erase_done = QtCore.Signal()  # ластик отпустили — всё стёртое за одно движение отменяется разом
     badge_clicked = QtCore.Signal(object)  # клик по номеру комментария на кадре
     image_requested = QtCore.Signal(object)  # инструмент Image: клик по пустому месту — добавить картинку
     image_edited = QtCore.Signal(object)  # картинку подвинули / отмасштабировали (заметка)
@@ -1295,6 +1297,8 @@ class Viewer(QOpenGLWidget):
         self.live = None
         self._pen_p = None  # нажим пера (Wacom и др.), пока перо касается; None — мышь
         self._wt_p = None  # то же через Wintab, если Qt нажима не даёт
+        self._erasing = False  # ластик прижат
+        self._eraser_pos = None  # где кружок ластика (под мышью)
         self._nav = None  # ("pan" | "zoom", точка, исходный масштаб) — Shift/Ctrl + тянуть
         self._last_wp = None
         self.info = None  # [(label, value)] — плашка с информацией о файле
@@ -1310,6 +1314,7 @@ class Viewer(QOpenGLWidget):
 
     def set_tool(self, tool):
         self.tool = tool
+        self._eraser_pos = None
         if tool != "image":
             self.sel_img = None
         self.setCursor(QtCore.Qt.CrossCursor if tool else QtCore.Qt.ArrowCursor)
@@ -1485,6 +1490,47 @@ class Viewer(QOpenGLWidget):
         """[(нота, штрих)] картинок на текущем кадре (не призраки), верхние — последними."""
         return [(n, s) for n, op, _ in self.overlay if op >= 0.999 for s in n.strokes if s.tool == "image"]
 
+    ERASE_R = 10  # радиус ластика в пикселях экрана
+
+    def _stroke_hit(self, s, t, pos):
+        """Задевает ли кружок ластика в pos штрих s (на кадре в рамке t)."""
+        if s.tool == "image":
+            return ann.image_rect(s, t).adjusted(-self.ERASE_R, -self.ERASE_R, self.ERASE_R, self.ERASE_R).contains(pos)
+        pts = [ann._map(t, q) for q in s.pts]
+        if not pts:
+            return False
+        w = max(1.0, s.width * t.height())
+        if len(pts) == 1 or (s.tool == "pen" and all(q == pts[0] for q in pts)):
+            return QtCore.QLineF(pts[0], pos).length() <= self.ERASE_R + w / 2
+        path = QtGui.QPainterPath()
+        if s.tool in ("rect", "ellipse"):
+            r = QtCore.QRectF(pts[0], pts[-1]).normalized()
+            path.addRect(r) if s.tool == "rect" else path.addEllipse(r)
+        elif s.tool == "arrow":
+            path.moveTo(pts[0])
+            path.lineTo(pts[-1])
+        else:
+            path.moveTo(pts[0])
+            for q in pts[1:]:
+                path.lineTo(q)
+        st = QtGui.QPainterPathStroker()
+        st.setWidth(w + 2 * self.ERASE_R)
+        st.setCapStyle(QtCore.Qt.RoundCap)
+        st.setJoinStyle(QtCore.Qt.RoundJoin)
+        return st.createStroke(path).contains(pos)
+
+    def _erase_at(self, pos):
+        """Стереть штрихи текущего кадра (не призраки соседних) под кружком ластика."""
+        if self.img is None:
+            return
+        t = self._target()
+        for note, op, _ in list(self.overlay):
+            if op < 0.999:
+                continue
+            for s in list(note.strokes):
+                if self._stroke_hit(s, t, pos):
+                    self.erased.emit(note, s)
+
     def _img_hit(self, pos):
         """('scale', нота, штрих, индекс угла) | ('move', нота, штрих, None) | None."""
         if self.img is None:
@@ -1588,6 +1634,14 @@ class Viewer(QOpenGLWidget):
             if self.live:
                 ann.paint_stroke(p, self.live, t)
             self._paint_selection(p, t)
+            if self.tool == "eraser" and self._eraser_pos is not None:  # кружок ластика
+                p.setClipping(False)
+                p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                p.setBrush(QtGui.QColor(255, 255, 255, 40 if self._erasing else 18))
+                p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160), 2.5))
+                p.drawEllipse(self._eraser_pos, self.ERASE_R, self.ERASE_R)
+                p.setPen(QtGui.QPen(QtGui.QColor(ui.TEXT), 1.2))
+                p.drawEllipse(self._eraser_pos, self.ERASE_R, self.ERASE_R)
         if self.error:
             p.setPen(QtGui.QColor(ui.ERROR))
             p.drawText(self.rect().adjusted(12, 12, -12, -12), QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop, self.error)
@@ -1814,6 +1868,13 @@ class Viewer(QOpenGLWidget):
                 self.image_requested.emit(self._norm(e.position()))
             self.update()
             return
+        if (self.tool == "eraser" and self.img is not None and e.button() == QtCore.Qt.LeftButton
+                and not e.modifiers() & QtCore.Qt.AltModifier):
+            self._erasing = True
+            self._eraser_pos = e.position()
+            self._erase_at(e.position())
+            self.update()
+            return
         if (self.tool and self.img is not None and e.button() == QtCore.Qt.LeftButton
                 and not e.modifiers() & QtCore.Qt.AltModifier):
             q = self._pen_pt(e.position(), start=True)
@@ -1840,6 +1901,17 @@ class Viewer(QOpenGLWidget):
         if self._wipe_drag:
             self._drag_wipe(e.position(), bool(e.modifiers() & QtCore.Qt.ShiftModifier))
             return
+        if self.tool == "eraser" and self._drag is None:
+            if self._erasing:  # между событиями мыши — промежуточные точки, чтобы быстрый взмах не проскакивал
+                a, b = self._eraser_pos or e.position(), e.position()
+                steps = max(1, int(QtCore.QLineF(a, b).length() / (self.ERASE_R * 0.7)))
+                for i in range(1, steps + 1):
+                    self._erase_at(a + (b - a) * (i / steps))
+            self._eraser_pos = e.position()
+            self.setCursor(QtCore.Qt.BlankCursor if self.img is not None else QtCore.Qt.ArrowCursor)
+            self.update()
+            if self._erasing or self._badge_at(e.position()) is None:
+                return
         if self._img_drag is not None:
             self._drag_image(e.position())
             self.update()
@@ -1915,6 +1987,11 @@ class Viewer(QOpenGLWidget):
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if self._erasing:
+            self._erasing = False
+            self.erase_done.emit()
+            self.update()
+            return
         if self._nav is not None:
             self._nav = None
             self.setCursor(QtCore.Qt.CrossCursor if self.tool else QtCore.Qt.ArrowCursor)
@@ -1948,6 +2025,9 @@ class Viewer(QOpenGLWidget):
             self.fit_view()
 
     def leaveEvent(self, e):
+        if self._eraser_pos is not None and not self._erasing:
+            self._eraser_pos = None
+            self.update()
         if self._wipe_hover:
             self._wipe_hover = False
             self.update()
@@ -3391,6 +3471,10 @@ class Player(QtWidgets.QMainWindow):
 
         self.viewer = Viewer()
         self.viewer.stroke_done.connect(self.on_stroke)
+        self.viewer.erased.connect(self.erase_stroke)
+        self.viewer.erase_done.connect(self.erase_finished)
+        self.edit_log = []  # для отмены: ("draw",) | ("erase", [(нота, место, штрих, нота удалена)])
+        self._erase_batch = []
         self.viewer.image_requested.connect(self.add_ref_image)
         self.viewer.image_edited.connect(lambda n: (self.note_edited(n), self.viewer.update()))
         self.viewer.bubble.changed.connect(self.bubble_changed)
@@ -3677,6 +3761,7 @@ class Player(QtWidgets.QMainWindow):
             QtCore.Qt.Key_I: self.mark_in,
             QtCore.Qt.Key_D: lambda: self.set_tool(None if self.viewer.tool else (self.last_tool or "pen")),
             QtCore.Qt.Key_N: self.new_note,
+            QtCore.Qt.Key_E: lambda: self.set_tool(None if self.viewer.tool == "eraser" else "eraser"),
             QtCore.Qt.Key_Escape: lambda: self.set_tool(None),
             QtCore.Qt.Key_Tab: lambda: self.notes_fold.set_open(not self.notes_fold.open),
             QtCore.Qt.Key_P: lambda: self.pl_fold.set_open(not self.pl_fold.open),
@@ -3820,6 +3905,7 @@ class Player(QtWidgets.QMainWindow):
         self.stop()
         self.viewer.bubble.close_edit()
         self.save_notes()
+        self.edit_log, self._erase_batch = [], []  # отмена — в пределах одного клипа
         if self.loader:
             self.loader.close()
         self.src = src
@@ -4839,13 +4925,14 @@ class Player(QtWidgets.QMainWindow):
         self.last_tool = "pen"
         for key, tip in (("pen", "Brush (D)"), ("arrow", "Arrow"),
                          ("rect", "Rectangle"), ("ellipse", "Ellipse"),
+                         ("eraser", f"Eraser (E) — drag over a drawing to erase it, {MOD}Z brings it back"),
                          ("image", f"Reference image ({MOD}{'⇧' if sys.platform == 'darwin' else 'Shift+'}I, paste {MOD}V) — click the frame to add, drag to move, "
                                    "corners to scale, Delete to remove")):
             b = ui.icon_button(key, tip, checkable=True)
             b.clicked.connect(lambda on, k=key: self.set_tool(k if on else None))
             self.tool_btns[key] = b
             tools.append(b)
-        undo = ui.icon_button("undo", f"Undo stroke ({MOD}Z)")
+        undo = ui.icon_button("undo", f"Undo stroke or erase ({MOD}Z)")
         undo.clicked.connect(self.undo_stroke)
         row.addWidget(hgroup(*tools, undo))
 
@@ -4949,7 +5036,7 @@ class Player(QtWidgets.QMainWindow):
 
     def set_tool(self, tool):
         if tool:
-            if tool != "image":
+            if tool not in ("image", "eraser"):  # D возвращает к рисованию, а не к ластику
                 self.last_tool = tool
             self.stop()
             self.draw_fold.set_open(True)
@@ -5072,6 +5159,7 @@ class Player(QtWidgets.QMainWindow):
             note = self.make_note()
         note.strokes.append(stroke)
         self.active = self.draw_note = note
+        self.edit_log.append(("draw",))
         self.notes_changed()
 
     def new_note(self):
@@ -5090,7 +5178,40 @@ class Player(QtWidgets.QMainWindow):
         num = next((k for k, n in self.store.numbered() if n is note), "") if self.store else ""
         QtCore.QTimer.singleShot(0, lambda: (self.viewer.bubble.open(note, num), self.viewer.update()))
 
+    def erase_stroke(self, note, s):
+        """Ластик задел штрих: убрать. Рисунок без текста, у которого не осталось штрихов, уходит целиком."""
+        if not self.store or s not in note.strokes:
+            return
+        i = note.strokes.index(s)
+        note.strokes.pop(i)
+        gone = False
+        if note.is_empty() and note in self.store.notes:
+            self.store.notes.remove(note)
+            gone = True
+            if self.active is note:
+                self.active = None
+            if self.draw_note is note:
+                self.draw_note = None
+            if self.viewer.sel_img is s:
+                self.viewer.sel_img = None
+        self._erase_batch.append((note, i, s, gone))
+        self.notes_changed()
+
+    def erase_finished(self):
+        if self._erase_batch:
+            self.edit_log.append(("erase", self._erase_batch))
+            self._erase_batch = []
+
     def undo_stroke(self):
+        if self.edit_log and self.edit_log[-1][0] == "erase":  # вернуть стёртое последним движением ластика
+            for note, i, s, gone in reversed(self.edit_log.pop()[1]):
+                if gone and note not in self.store.notes:
+                    self.store.notes.append(note)
+                note.strokes.insert(min(i, len(note.strokes)), s)
+            self.notes_changed()
+            return
+        if self.edit_log:
+            self.edit_log.pop()
         n = self.active
         if n is None or n.frame != self.frame:
             cands = [x for x in self.store.notes if x.frame == self.frame and x.strokes] if self.store else []

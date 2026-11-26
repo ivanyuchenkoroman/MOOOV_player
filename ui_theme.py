@@ -442,6 +442,16 @@ def _draw(p, name):
             p.drawRoundedRect(QtCore.QRectF(3, 5, 12, 8), 1, 1)
         elif name == "ellipse":
             p.drawEllipse(QtCore.QRectF(3, 4.5, 12, 9))
+        elif name == "eraser":  # ластик наискосок, полоска-манжета и линия стёртого
+            path = QtGui.QPainterPath(P(2.8, 11.2))
+            path.lineTo(9.3, 4.7)
+            path.lineTo(14.2, 9.6)
+            path.lineTo(8.6, 15.2)
+            path.lineTo(5.4, 15.2)
+            path.closeSubpath()
+            p.drawPath(path)
+            p.drawLine(P(6.1, 7.9), P(11, 12.8))
+            p.drawLine(P(10.5, 15.2), P(15.5, 15.2))
         elif name == "undo":
             path = QtGui.QPainterPath(P(5, 7.5))
             path.lineTo(11, 7.5)
