@@ -6,7 +6,7 @@ import sys
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 NAME = "MOOOV_player"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 IS_MAC = sys.platform == "darwin"
 
 VIDEO = ["mov", "mp4", "m4v", "avi", "mkv", "webm", "mxf"]

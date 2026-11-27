@@ -1,3 +1,17 @@
+# MOOOV_player 1.1.1
+
+## New in 1.1.1
+- Pen pressure from a Wacom tablet now works in comments (also with Windows Ink turned off).
+- Drawing without pressing "+" makes its own comment, "Sketch on frame". After Enter on a comment, new strokes on the same frame start a new one.
+- Pen-friendly navigation: hold Shift and drag to pan, hold Ctrl and drag to zoom.
+- Eraser (E): drag over a drawing to erase strokes; Cmd/Ctrl+Z brings them back.
+- Stickers: the star button in the drawing panel opens a grid of stickers. Pick one and click the frame to put it; drag to move, corners to scale. "Open my stickers folder…" lets you add your own SVG or PNG.
+- Timeline: layers snap to edges, the playhead, In/Out and other layers; trim a layer from either side; put the top layer at the start or end of the main edit; drag clips from the playlist onto the timeline.
+- The cache keeps 2 seconds behind the playhead too, so stepping back is instant.
+- PDF: the header says "Recorded with MOOOV_player <version> by <author>", with the date and file name highlighted. Fixed Acrobat crashing after opening an exported PDF.
+- Thinner, smoother selection handles; antialiased drawing in the viewer.
+- Windows installer in the player's style.
+
 # MOOOV_player 1.1
 
 ## New in 1.1: Playlists

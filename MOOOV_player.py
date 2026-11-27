@@ -251,7 +251,7 @@ BLEND_MODES = {
     "Darken": QtGui.QPainter.CompositionMode_Darken,
     "Difference": QtGui.QPainter.CompositionMode_Difference,
 }  # подписи сочетаний клавиш под систему
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 AUTHOR = "Ivaniuchenko Roman"
 SITE = "mooov.team"
 SITE_URL = "https://mooov.team"

@@ -1,7 +1,7 @@
 ; Inno Setup — установщик MOOOV_player для Windows.
 ; Собирается автоматически из build_windows.bat (нужен Inno Setup 6).
 #define AppName "MOOOV_player"
-#define AppVersion "1.1.0"
+#define AppVersion "1.1.1"
 
 [Setup]
 AppId={{6F2B8E51-3C1A-4D7E-9B0A-4D4F4F4F5601}
